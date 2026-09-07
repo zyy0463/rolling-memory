@@ -5,6 +5,16 @@
 
 本项目提取自一个私人 AI 伴侣项目的记忆系统，去掉了全部业务耦合，只保留通用的记忆层。
 
+## 这个模块部署在哪？谁都能用吗？
+
+rolling-memory **不是一个独立服务，而是嵌在"中间层"里的模块**——它需要一个位置，能同时看到"客户端发来的消息数组"（观察滑窗）和"即将发给 LLM 的最终消息数组"（注入摘要）。三种情况：
+
+| 你的现状 | 接法 | 难度 |
+|---|---|---|
+| **有自己的网关/中转**（自建 API 代理、转发服务） | 三件套接入（见下文） | 5 分钟，加 3 行代码 |
+| **没有网关，客户端只能填 API 地址**（大多数 App 用户） | 用内置的本地转发代理 `npm run proxy` | 装好 Node 后改一个网址，无需写代码 |
+| **客户端直连 LLM 且中间什么都装不了** | 用不了——本模块必须有个位置拦截/注入请求 | — |
+
 ## 架构
 
 ```
@@ -45,6 +55,31 @@ for (const blk of rolling.injectBlocks()) messages.push(blk);
 
 就这些。其他一切（攒批、去重、结算、压缩、落盘、重试）都在模块内部完成。
 
+## 没有网关？用内置的本地转发代理
+
+大多数聊天 App 的设置里只有一栏「API 地址」。这时不需要写任何代码：
+
+1. 安装 Node.js（≥18），下载本仓库，复制 `.env.example` 为 `.env` 并填好三个必配项
+2. 在仓库目录运行：
+
+```bash
+npm run proxy
+```
+
+3. 把客户端里的 API 地址改成 `http://127.0.0.1:8787/v1/chat/completions`——**密钥原样不动，模型名原样不动**
+
+之后客户端的每次请求都会经过代理：滑出的消息被自动结算成摘要，下轮请求自动带上。响应（含流式输出）原样透传，客户端无感知。端口可在 `.env` 里用 `PROXY_PORT` 改。
+
+## 迷你查看器
+
+另开一个终端运行：
+
+```bash
+npm run view
+```
+
+浏览器打开 http://127.0.0.1:8788 ，只读展示 T1/T2 当前内容、字数余量、待结算缓冲，每 5 秒自动刷新。想人工修正记忆，直接编辑 `state/summaries.json`，模块下次结算前会重读它。
+
 ## 配置
 
 复制 `.env.example` 为 `.env`（或直接设环境变量）：
@@ -63,6 +98,8 @@ for (const blk of rolling.injectBlocks()) messages.push(blk);
 | `LEDGER_LLM_TIMEOUT_MS` | 60000 | 结算接口超时 |
 | `LEDGER_ENABLED` | true | 总开关 |
 | `ROLLING_MEMORY_STATE_DIR` | 模块内 `state/` | 摘要落盘目录（可选） |
+| `PROXY_PORT` | 8787 | 本地转发代理端口（`npm run proxy`） |
+| `VIEWER_PORT` | 8788 | 迷你查看器端口（`npm run view`） |
 
 兼容别名：`TARGET_API_URL` / `TARGET_API_KEY` 等效于 `LEDGER_API_URL` / `LEDGER_API_KEY`。
 

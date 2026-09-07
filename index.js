@@ -292,4 +292,23 @@ async function chatOnce(systemPrompt, userPrompt) {
   }
 }
 
-module.exports = { init, observeRequest, injectBlocks };
+// ========================
+// 运行状态（供查看器/调试）：只读内存态，无 IO、永不抛
+// ========================
+function stats() {
+  return {
+    enabled: cfg.enabled,
+    model: cfg.model,
+    t1: summaryState.t1,
+    t2: summaryState.t2,
+    updated_at: summaryState.updated_at,
+    t1Chars: summaryState.t1.length,
+    t2Chars: summaryState.t2.length,
+    t1MaxChars: cfg.t1MaxChars,
+    t2MaxChars: cfg.t2MaxChars,
+    pendingCount: pending.length,
+    pendingChars: pendingChars(),
+  };
+}
+
+module.exports = { init, observeRequest, injectBlocks, stats };
