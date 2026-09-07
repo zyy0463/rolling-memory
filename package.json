@@ -1,0 +1,10 @@
+{
+  "name": "rolling-memory",
+  "version": "1.0.0",
+  "description": "两层滚动记忆：滑出对话窗口的消息自动结算成 T1 近期摘要 + T2 远期梗概，每次请求自动注入回 LLM 上下文",
+  "main": "index.js",
+  "license": "MIT",
+  "engines": { "node": ">=18" },
+  "keywords": ["llm", "memory", "context-window", "summarization", "gateway", "chatbot"],
+  "files": ["index.js", "README.md", "LICENSE", ".env.example"]
+}
