@@ -533,9 +533,9 @@ t("运行时行为：init() 后新字段可读且是默认值", () => {
   assert.strictEqual(s.t1LightCompressTo, 400);
   assert.strictEqual(typeof rolling.repackT1, "function", "应导出 repackT1");
 });
-t("package.json 版本为 1.5.0", () => {
+t("package.json 版本为 1.6.0", () => {
   const pkg = JSON.parse(fs.readFileSync(path.join(__dirname, "..", "package.json"), "utf8"));
-  assert.strictEqual(pkg.version, "1.5.0");
+  assert.strictEqual(pkg.version, "1.6.0");
 });
 t("README 写了 v1.5 的压缩策略（两条触发 / 跨天整压 / 轻整压）", () => {
   assert.ok(/v1\.5/.test(README));
@@ -551,6 +551,59 @@ t(".env.example 含 v1.5 四个新变量", () => {
   assert.ok(/LEDGER_T1_COMPRESS_TO=1200/.test(ENVEX));
   assert.ok(/LEDGER_T1_LIGHT_LINES=4/.test(ENVEX));
   assert.ok(/LEDGER_T1_LIGHT_COMPRESS_TO=400/.test(ENVEX));
+});
+
+console.log("\n[14] v1.6：注入块「优先级声明」（修外置记忆库被抢）");
+t("注入块头带优先级声明（给模型看的，不是给装的人看的）", () => {
+  const i = SRC.indexOf("function injectBlocks()");
+  const seg = SRC.slice(i, i + 1400);
+  assert.ok(/系统注入 · 滚动摘要/.test(seg), "块头应有「系统注入 · 滚动摘要」声明");
+  assert.ok(/不是用户新说的话/.test(seg), "应说明这不是用户的新消息");
+  assert.ok(/不是长期事实的权威来源/.test(seg), "应说明它不是长期事实的权威来源");
+  assert.ok(/以长期记忆为准/.test(seg), "冲突时应以长期记忆为准");
+  assert.ok(/去查长期记忆/.test(seg), "要精确细节应去查长期记忆");
+});
+t("声明在摘要正文之前（模型先读到优先级，再读到内容）", () => {
+  const i = SRC.indexOf("function injectBlocks()");
+  const seg = SRC.slice(i, i + 1400);
+  const decl = seg.indexOf("系统注入 · 滚动摘要");
+  const body = seg.indexOf("【更早对话的滚动摘要");
+  assert.ok(decl > 0 && body > decl, "声明必须排在摘要正文之前");
+});
+t("声明是固定文案，不掺易变内容（缓存友好 + 不随摘要漂移）", () => {
+  const i = SRC.indexOf("function injectBlocks()");
+  const declSeg = SRC.slice(i, SRC.indexOf("【更早对话的滚动摘要", i));
+  assert.ok(!/\$\{/.test(declSeg), "声明里不得拼接变量");
+});
+t("空摘要时不注入（多了一段声明也不能凭空造块）", () => {
+  rolling.init();
+  const before = rolling.injectBlocks();
+  assert.ok(Array.isArray(before));
+  assert.ok(before.length === 0, "T1/T2 皆空时应返回空数组");
+});
+t("有摘要时，块 0 以声明开头、摘要正文在后", () => {
+  fs.writeFileSync(
+    path.join(TMP, "summaries.json"),
+    JSON.stringify({
+      t1_lines: [{ ts: "9.23日 10:00", text: "9.23日 10:00：测试话题。" }],
+      t1_state: "9.23日 10:05：状态正常。",
+      t2_lines: [],
+    }),
+    "utf8"
+  );
+  rolling.init();
+  const blocks = rolling.injectBlocks();
+  assert.strictEqual(blocks.length, 1, "有摘要就应有 1 个注入块");
+  const c = blocks[0].content;
+  assert.ok(c.startsWith("【系统注入 · 滚动摘要】"), "块必须以声明开头，实际：" + c.slice(0, 30));
+  assert.ok(c.indexOf("系统注入 · 滚动摘要") < c.indexOf("【更早对话的滚动摘要"), "声明应在正文之前");
+  assert.ok(/测试话题/.test(c), "摘要正文应在块内");
+});
+t("README 有「和外置记忆库一起用」一节 + 可抄的补充 prompt", () => {
+  assert.ok(/和外置长期记忆库一起用/.test(README));
+  assert.ok(/长期记忆库是长期事实的权威来源/.test(README), "应给出可抄的补充 prompt");
+  assert.ok(/抢掉了/.test(README), "应引用使用者的原始反馈");
+  assert.ok(/v1\.6/.test(README));
 });
 
 // 清理
