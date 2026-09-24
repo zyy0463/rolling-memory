@@ -260,7 +260,7 @@ t("stats() 暴露 upstreamSeparated", () => {
 });
 t("stats() 对外契约仍是渲染后的 t1/t2 字符串", () => {
   const i = SRC.indexOf("function stats()");
-  const body = SRC.slice(i, i + 700);
+  const body = SRC.slice(i, i + 900);
   assert.ok(/const t1 = renderT1\(\);/.test(body));
   assert.ok(/const t2 = renderT2\(\);/.test(body));
   assert.ok(/t1Chars: t1\.length/.test(body));
@@ -441,9 +441,9 @@ t("viewer 渲染 T1 用升序下标（显示倒序，删的必须是对的哪一
   assert.ok(/data-i="/.test(VIEWER_SRC) && /getAttribute\("data-i"\)/.test(VIEWER_SRC), "行上应带升序下标");
   assert.ok(/for\(var i=a\.length-1;i>=0;i--\)/.test(VIEWER_SRC), "显示应倒序");
 });
-t("package.json 版本为 1.4.0", () => {
+t("package.json 版本 ≥ 1.4.0（v1.4 已并入主线，当前版本号见 [13]）", () => {
   const pkg = JSON.parse(fs.readFileSync(path.join(__dirname, "..", "package.json"), "utf8"));
-  assert.strictEqual(pkg.version, "1.4.0");
+  assert.ok(Number(pkg.version.split(".")[1]) >= 4, `当前版本 ${pkg.version}，应 ≥ 1.4.0`);
 });
 t("README 写了 v1.4 的编辑能力与 T2 合并兜底", () => {
   assert.ok(/deleteRows/.test(README) && /editRows/.test(README) && /api\/ledger/.test(README));
@@ -451,6 +451,106 @@ t("README 写了 v1.4 的编辑能力与 T2 合并兜底", () => {
   assert.ok(/不再把摘出的行退回 T1|不再退回/.test(README));
   assert.ok(/reasoning_effort/.test(README));
   assert.ok(/v1\.4/.test(README));
+});
+
+console.log("\n[13] v1.5：压缩策略改版（行数触发 / 跨天整压 / 跨天轻整压）");
+t("DEFAULTS 新增四项（16 行 / 1200 字 / 4 行 / 400 字）", () => {
+  assert.ok(/t1MaxLines: 16,/.test(SRC));
+  assert.ok(/t1CompressTo: 1200,/.test(SRC));
+  assert.ok(/t1LightLines: 4,/.test(SRC));
+  assert.ok(/t1LightCompressTo: 400,/.test(SRC));
+});
+t("T1 触发是「字数或行数」两条任一", () => {
+  assert.ok(/function t1OverLimit\(\)/.test(SRC));
+  assert.ok(/t1Chars\(\) > cfg\.t1MaxChars \|\| t1Lines\.length >= cfg\.t1MaxLines/.test(SRC));
+  assert.ok(/function t1WithinTarget\(\)/.test(SRC));
+});
+t("白天摘行一次收到目标值（不再摘一个刚刚好的量）", () => {
+  const seg = SRC.slice(SRC.indexOf("function evictT1OverLimit"), SRC.indexOf("function mechRepackToTarget"));
+  assert.ok(/if \(!t1OverLimit\(\)\) return moved;/.test(seg), "未超限时不应动手");
+  assert.ok(/while \(t1Lines\.length > cfg\.minKeepT1 && !t1WithinTarget\(\)\)/.test(seg));
+});
+t("跨天整压 repackT1：留在 T1、幂等落盘、今天的行原样保留", () => {
+  assert.ok(/async function repackT1\(oldLines, opts = \{\}\)/.test(SRC));
+  assert.ok(/const keep = t1Lines\.filter\(\(l\) => isTodayLine\(l\)\);/.test(SRC));
+  assert.ok(/t1Lines = packed\.concat\(keep\);/.test(SRC), "整压产物必须留在 T1（不是推进 T2）");
+  assert.ok(/lastRepackDay = dayKey8\(\);/.test(SRC));
+  assert.ok(/last_repack_day: lastRepackDay,/.test(SRC), "幂等键必须落盘");
+  assert.ok(/lastRepackDay = parsed\.last_repack_day \|\| null;/.test(SRC), "重启后要能读回");
+});
+t("跨天轻整压：目标分流 + 行数必须真的减少", () => {
+  assert.ok(/const limit = light \? cfg\.t1LightCompressTo : cfg\.t1CompressTo;/.test(SRC));
+  assert.ok(/这是「轻整压」/.test(SRC));
+  assert.ok(/packed\.length >= oldLines\.length/.test(SRC), "行数没减少应视为不可用");
+  assert.ok(/kind: light \? "t1-light-repack" : "t1-repack"/.test(SRC));
+});
+t("触发顺序：跨天重压 > 跨天轻压 > 白天摘行", () => {
+  const seg = SRC.slice(SRC.indexOf("const repackDayFree"), SRC.indexOf("if (moved.length)"));
+  const iRepack = seg.indexOf("if (shouldRepack)");
+  const iLight = seg.indexOf("} else if (shouldLight)");
+  const iEvict = seg.indexOf("} else if (t1OverLimit())");
+  assert.ok(iRepack >= 0 && iLight > iRepack && iEvict > iLight, "三个分支顺序不对");
+  assert.ok(/const shouldLight = !shouldRepack && repackDayFree && oldLines\.length >= cfg\.t1LightLines;/.test(SRC));
+  assert.ok(/const shouldRepack = repackDayFree && oldChars > cfg\.t1CompressTo;/.test(SRC));
+});
+t("跨天压缩失败走机械兜底，且只摘非今天的行（可传目标）", () => {
+  assert.ok(/function mechRepackToTarget\(limit = cfg\.t1CompressTo\)/.test(SRC));
+  assert.ok(/const old = t1Lines\.filter\(\(l\) => !isTodayLine\(l\)\);/.test(SRC));
+  assert.ok(/mechRepackToTarget\(limit\)/.test(SRC));
+  assert.ok(!/t1Lines = moved\.concat\(t1Lines\)/.test(SRC), "兜底不得把行退回 T1");
+});
+t("东八日期口径：dayKey8 / isTodayLine，解析不出的按非今天", () => {
+  assert.ok(/function dayKey8\(d = new Date\(\)\)/.test(SRC));
+  assert.ok(/function isTodayLine\(line\)/.test(SRC));
+  assert.ok(/return d !== null && dayKey8\(d\) === dayKey8\(\);/.test(SRC));
+});
+t("init() 读四个新 env，并在日志里说明策略", () => {
+  assert.ok(/num\("LEDGER_T1_MAX_LINES", DEFAULTS\.t1MaxLines\)/.test(SRC));
+  assert.ok(/num\("LEDGER_T1_COMPRESS_TO", DEFAULTS\.t1CompressTo\)/.test(SRC));
+  assert.ok(/num\("LEDGER_T1_LIGHT_LINES", DEFAULTS\.t1LightLines\)/.test(SRC));
+  assert.ok(/num\("LEDGER_T1_LIGHT_COMPRESS_TO", DEFAULTS\.t1LightCompressTo\)/.test(SRC));
+  assert.ok(/非今天 ≥\$\{cfg\.t1LightLines\} 行时轻整压到/.test(SRC));
+});
+t("view()/stats() 暴露新 limits，供查看器与调试读", () => {
+  assert.ok(/t1_max_lines: cfg\.t1MaxLines,/.test(SRC));
+  assert.ok(/t1_compress_to: cfg\.t1CompressTo,/.test(SRC));
+  assert.ok(/t1_light_lines: cfg\.t1LightLines,/.test(SRC));
+  assert.ok(/t1_light_compress_to: cfg\.t1LightCompressTo,/.test(SRC));
+  assert.ok(/last_repack_day: lastRepackDay,/.test(SRC));
+});
+t("结算日志区分三种压缩（不再一律写「摘出 N 行」）", () => {
+  assert.ok(/压缩 \$\{what\}/.test(SRC));
+  assert.ok(/跨天整压（非今天 \$\{oldChars\}→/.test(SRC));
+  assert.ok(/跨天轻整压（非今天 \$\{oldLines\.length\} 行/.test(SRC));
+  assert.ok(/摘出 \$\{moved\.length\} 行（\$\{trig\}）/.test(SRC));
+});
+t("运行时行为：init() 后新字段可读且是默认值", () => {
+  rolling.init();
+  const s = rolling.stats();
+  assert.strictEqual(s.t1MaxLines, 16);
+  assert.strictEqual(s.t1CompressTo, 1200);
+  assert.strictEqual(s.t1LightLines, 4);
+  assert.strictEqual(s.t1LightCompressTo, 400);
+  assert.strictEqual(typeof rolling.repackT1, "function", "应导出 repackT1");
+});
+t("package.json 版本为 1.5.0", () => {
+  const pkg = JSON.parse(fs.readFileSync(path.join(__dirname, "..", "package.json"), "utf8"));
+  assert.strictEqual(pkg.version, "1.5.0");
+});
+t("README 写了 v1.5 的压缩策略（两条触发 / 跨天整压 / 轻整压）", () => {
+  assert.ok(/v1\.5/.test(README));
+  assert.ok(/轻整压/.test(README));
+  assert.ok(/跨天/.test(README));
+  assert.ok(/`LEDGER_T1_MAX_LINES` \| 16/.test(README), "README 应写 T1_MAX_LINES=16");
+  assert.ok(/`LEDGER_T1_COMPRESS_TO` \| 1200/.test(README));
+  assert.ok(/`LEDGER_T1_LIGHT_LINES` \| 4/.test(README));
+  assert.ok(/`LEDGER_T1_LIGHT_COMPRESS_TO` \| 400/.test(README));
+});
+t(".env.example 含 v1.5 四个新变量", () => {
+  assert.ok(/LEDGER_T1_MAX_LINES=16/.test(ENVEX));
+  assert.ok(/LEDGER_T1_COMPRESS_TO=1200/.test(ENVEX));
+  assert.ok(/LEDGER_T1_LIGHT_LINES=4/.test(ENVEX));
+  assert.ok(/LEDGER_T1_LIGHT_COMPRESS_TO=400/.test(ENVEX));
 });
 
 // 清理

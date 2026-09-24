@@ -29,6 +29,16 @@
 //   的根因（线上四次 t2-merge 全因 thinking 烧满 max_tokens 返回空 → 行被退回 → 越滚越长）。
 //   现在合并调用关掉 thinking（reasoning_effort: minimal），失败改走机械兜底并入。
 //
+// 【v1.5 压缩策略改版】T1 从"只看一个字数上限"改成"字数或行数两条任一触发"，并区分两种跨天压缩：
+//   ① 白天：仍是机械摘行（从最旧端摘到目标字数内并入 T2）；
+//   ② 跨天**首次**结算（一天一次，幂等键 last_repack_day 落盘）：
+//      · 昨天那部分 > t1CompressTo → 「整压」：整体重压到 t1CompressTo，**结果留在 T1**
+//        （保住昨天一整天的脉络，而不是被一行行摘进 T2 后细节掉光）；
+//      · 昨天那部分没到 t1CompressTo 但行数 ≥ t1LightLines → 「轻整压」：合并到
+//        t1LightCompressTo 留在 T1（主要目的是省行额；产出必须真的比原文行数少，否则视为不可用）。
+//   两条路失败都走机械兜底（摘**非今天**的行进 T2），绝不保留原样。
+//   新增四个可调项：t1MaxLines / t1CompressTo / t1LightLines / t1LightCompressTo。
+//
 // 【重要】本模块是"防失忆"的滑动摘要，不是记忆库，也不能代替记忆库。
 //   它只保证窗口外近两天的对话还能被衔接上；更早的、需要精确检索的内容
 //   请交给专门的外置记忆库。T2 是"噪声沉降池"：它的作用之一就是让远期
@@ -60,7 +70,11 @@ const DEFAULTS = {
   bufferCount: 6,           // 缓冲攒够多少"条"触发一次结算（主判据）
   bufferChars: 400,         // 字数兜底：单批超长时即使没到条数也结算（防抖）
   pendingMaxChars: 12000,   // 缓冲上限：结算连续失败时丢最旧，防内存膨胀
-  t1MaxChars: 1500,         // T1（话题行 + 状态节）超过则从最旧端摘行并入 T2
+  t1MaxChars: 1500,         // T1（话题行 + 状态节）超过则动手压缩（v1.5 起是"两条触发"之一）
+  t1MaxLines: 16,           // T1 行数达到这个值也触发压缩（v1.5 新增：短句多的时候只靠字数会拖太久）
+  t1CompressTo: 1200,       // 压缩目标：摘行/跨天整压都收到这个字数以内（v1.5 新增）
+  t1LightLines: 4,          // 非今天部分达到这么多行 → 跨天「轻整压」（v1.5 新增）
+  t1LightCompressTo: 400,   // 轻整压目标：把"行"合并到这个字数内（v1.5 新增，昨天本来就不到 t1CompressTo 时用）
   t2MaxChars: 360,          // T2 封顶（v1.3：220→360，220 字装不下"能独立读懂"的短句，只会逼出电报体）
   t2MaxDays: 7,             // T2 日期淘汰：比这更旧的行直接丢，不再永久保留（v1.3 新增）
   minKeepT1: 3,             // T1 淘汰保底：至少留这么多行，防一次结算把 T1 摘空
@@ -80,6 +94,7 @@ let t2Lines = [];                  // T2 梗概行，**升序**，从 T1 最旧�
 let updatedAt = null;
 let summaryState = {};             // 最近一次落盘的完整对象（含 t1/t2 字符串镜像），仅用于观测
 let loadedMtimeMs = 0;             // 上次读/写盘时 summaries.json 的 mtime（v1.4：外部改动检测）
+let lastRepackDay = null;          // 【v1.5】上次「跨天整压/轻整压」发生在哪一天（东八，形如 2026-9-24），落盘
 let lastMsgs = [];        // 上一请求的消息（内存，重启冷启动）
 let pending = [];         // 滑出待结算缓冲 [{role, text, fp}]
 let pendingFps = new Set();
@@ -126,6 +141,20 @@ function parseTsDate(ts) {
   let year = n8.getUTCFullYear();
   if (month > n8.getUTCMonth() + 2) year -= 1;
   return new Date(Date.UTC(year, month - 1, day, 0, 0, 0) - 8 * 3600 * 1000);
+}
+
+// 【v1.5】东八「今天」的键（形如 2026-9-24）。parseTsDate 返回的是当地 0 点，
+// 加 8h 后按 getUTC* 读即回到原年月日，与 tsOf 的解析口径一致。
+function dayKey8(d = new Date()) {
+  const n8 = new Date(d.getTime() + 8 * 3600 * 1000);
+  return `${n8.getUTCFullYear()}-${n8.getUTCMonth() + 1}-${n8.getUTCDate()}`;
+}
+
+// 【v1.5】这一行是不是「今天」的。时间戳解析不出来（迁移残留的碎片）按"不是今天"处理——
+// 它无法被确认属于今天，就不该享受"今天的行原样保留"的豁免。
+function isTodayLine(line) {
+  const d = parseTsDate(line && line.ts);
+  return d !== null && dayKey8(d) === dayKey8();
 }
 
 function makeLine(text) {
@@ -198,11 +227,41 @@ function matchesClose(line, closeList) {
   });
 }
 
-// 超限淘汰：从最旧端摘行，摘到 ≤ t1MaxChars 为止（保底留 minKeepT1 行）
+// 【v1.5】是否该压缩 T1：字数超 t1MaxChars **或** 行数达 t1MaxLines（两条任一即触发）。
+function t1OverLimit() {
+  return t1Chars() > cfg.t1MaxChars || t1Lines.length >= cfg.t1MaxLines;
+}
+
+// 【v1.5】是否已经压到位：字数 ≤ t1CompressTo **且** 行数 < t1MaxLines。
+// 两个条件都要（只看字数的话，16 行短句凑到 900 字仍会因行数触发出手）。
+function t1WithinTarget() {
+  return t1Chars() <= cfg.t1CompressTo && t1Lines.length < cfg.t1MaxLines;
+}
+
+// 超限淘汰（白天那条路）：从最旧端摘行，摘到「既 ≤ t1CompressTo 又 < t1MaxLines」为止
+// （保底留 minKeepT1 行）。v1.5 之前是摘到 ≤ t1MaxChars，一次只挪一个"刚刚好"的量，
+// 结果每来一条新行就又超限、又摘一次；现在一次收到目标值，少折腾。
 function evictT1OverLimit() {
   const moved = [];
-  while (t1Chars() > cfg.t1MaxChars && t1Lines.length > cfg.minKeepT1) {
+  if (!t1OverLimit()) return moved;
+  while (t1Lines.length > cfg.minKeepT1 && !t1WithinTarget()) {
     moved.push(t1Lines.shift());
+  }
+  return moved;
+}
+
+// 【v1.5】跨天压缩失败时的机械兜底：从最旧端摘**非今天**的行，直到这部分 ≤ limit。
+// 为什么只摘非今天的行：跨天压缩的语义就是"昨天的整体收敛、今天的原样保留"，
+// 兜底也不能把今天的行摘掉（否则一天的连续性当场断）。保底同样留 minKeepT1 行。
+function mechRepackToTarget(limit = cfg.t1CompressTo) {
+  const moved = [];
+  for (;;) {
+    if (t1Lines.length <= cfg.minKeepT1) break;
+    const old = t1Lines.filter((l) => !isTodayLine(l));
+    if (!old.length) break;
+    const chars = old.reduce((s, l) => s + l.text.length, 0);
+    if (chars <= limit) break;
+    moved.push(t1Lines.splice(t1Lines.indexOf(old[0]), 1)[0]);
   }
   return moved;
 }
@@ -253,6 +312,7 @@ function loadSummary() {
       t2Lines = normalizeLines(parsed.t2_lines);
       t1State = String(parsed.t1_state || "");
       updatedAt = parsed.updated_at || null;
+      lastRepackDay = parsed.last_repack_day || null; // 【v1.5】
       summaryState = parsed;
     } else {
       // 【v1.3 迁移】旧格式一次性转结构，立刻落盘（不压缩、不清空，内容全保留）
@@ -313,6 +373,7 @@ function saveSummary() {
       t2_lines: t2Lines,
       t1: renderT1(),
       t2: renderT2(),
+      last_repack_day: lastRepackDay, // 【v1.5】跨天压缩的幂等键，必须落盘（否则重启后会重复压、烧钱）
       updated_at: updatedAt,
     };
     // 【v1.4】改成 tmp + rename 原子替换：viewer 与本进程都可能改这个文件，
@@ -342,7 +403,16 @@ function view() {
     t1_state: t1State,
     t1_chars: t1Chars(),
     t2_chars: t2Chars(),
-    limits: { t1_max_chars: cfg.t1MaxChars, t2_max_chars: cfg.t2MaxChars, t2_max_days: cfg.t2MaxDays },
+    last_repack_day: lastRepackDay, // 【v1.5】
+    limits: {
+      t1_max_chars: cfg.t1MaxChars,
+      t1_max_lines: cfg.t1MaxLines,               // 【v1.5】
+      t1_compress_to: cfg.t1CompressTo,           // 【v1.5】
+      t1_light_lines: cfg.t1LightLines,           // 【v1.5】
+      t1_light_compress_to: cfg.t1LightCompressTo, // 【v1.5】
+      t2_max_chars: cfg.t2MaxChars,
+      t2_max_days: cfg.t2MaxDays,
+    },
     updated_at: updatedAt,
   };
 }
@@ -441,6 +511,11 @@ function init(opts = {}) {
     bufferChars: num("LEDGER_BUFFER_CHARS", DEFAULTS.bufferChars),
     pendingMaxChars: num("LEDGER_PENDING_MAX_CHARS", DEFAULTS.pendingMaxChars),
     t1MaxChars: num("LEDGER_T1_MAX_CHARS", DEFAULTS.t1MaxChars),
+    // 【v1.5】T1 压缩策略四项：行数触发 + 压缩目标 + 跨天轻整压的两项
+    t1MaxLines: num("LEDGER_T1_MAX_LINES", DEFAULTS.t1MaxLines),
+    t1CompressTo: num("LEDGER_T1_COMPRESS_TO", DEFAULTS.t1CompressTo),
+    t1LightLines: num("LEDGER_T1_LIGHT_LINES", DEFAULTS.t1LightLines),
+    t1LightCompressTo: num("LEDGER_T1_LIGHT_COMPRESS_TO", DEFAULTS.t1LightCompressTo),
     // 以下三项 DEFAULTS 里有定义、旧版 init() 却漏读，导致 .env 配了也不生效。v1.3 补齐。
     t2MaxChars: num("LEDGER_T2_MAX_CHARS", DEFAULTS.t2MaxChars),
     t2MaxDays: num("LEDGER_T2_MAX_DAYS", DEFAULTS.t2MaxDays),
@@ -449,10 +524,15 @@ function init(opts = {}) {
     userLabel: getEnv("LEDGER_USER_LABEL", DEFAULTS.userLabel),
     assistantLabel: getEnv("LEDGER_ASSISTANT_LABEL", DEFAULTS.assistantLabel),
   };
+  // 【v1.5】压缩目标不得高于触发线：t1CompressTo 配得比 t1MaxChars 大时，
+  // "摘到目标内"永远摘不到（摘完仍超限），会变成每轮都摘一次却始终超限的静默故障。
+  // 默认值本身是自洽的（1200 < 1500），这里只是防手配歪。
+  if (cfg.t1CompressTo > cfg.t1MaxChars) cfg.t1CompressTo = cfg.t1MaxChars;
   loadSummary();
   const sameUpstream = !cfg.chatApiBase || cfg.chatApiBase === cfg.apiBase;
   log(
-    `已初始化（结算 model=${cfg.model || "未配置"}，T1上限 ${cfg.t1MaxChars} 字，` +
+    `已初始化（结算 model=${cfg.model || "未配置"}，T1 压到 ${cfg.t1CompressTo} 字（超 ${cfg.t1MaxChars} 字或 ${cfg.t1MaxLines} 行触发），` +
+    `非今天 ≥${cfg.t1LightLines} 行时轻整压到 ${cfg.t1LightCompressTo} 字，` +
     `摘要 T1=${t1Lines.length} 行/${t1Chars()} 字 / T2=${t2Lines.length} 行/${t2Chars()} 字，T2 淘汰 ${cfg.t2MaxDays} 天，` +
     `触发=${cfg.bufferCount} 条/${cfg.bufferChars} 字，上游=${sameUpstream ? "与对话同源" : "独立（双上游）"}）`
   );
@@ -677,8 +757,36 @@ ${lines.slice(0, 6000)}`;
   updatedAt = new Date().toISOString();
   saveSummary(); // 先落盘：即便下面的 T2 合并失败，append/close 也不丢
 
-  // ④ T1 超限 → 从最旧端摘行并入 T2
-  const moved = evictT1OverLimit();
+  // ④ T1 压缩：**跨天整压优先**——新的一天第一次结算，把「非今天」的行整体压到 ≤t1CompressTo
+  //    留在 T1（保住昨天一整天的脉络 + 今天照常累积）。一天只做一次（lastRepackDay 幂等）。
+  //    这里**不看超限**：若只看超限，昨天攒到 1600 字（没到 2000）就永远等不到整压，
+  //    只会在白天被一行行摘进 T2——那正是"一整天连续性丢掉"的根。非今天部分已经比目标还短
+  //    时不重压，免得白花一次调用；但行数 ≥t1LightLines 时改走「轻整压」（合并到更小的目标，
+  //    主要目的是省行额，免得被白天的行数规则一行行摘进 T2）。
+  const oldLines = t1Lines.filter((l) => !isTodayLine(l));
+  const oldChars = oldLines.reduce((s, l) => s + l.text.length, 0);
+  const todayKey = dayKey8();
+  // 触发缘由必须在动手之前取——摘完行再看就看不出这次是「字数」还是「条数」触发的了
+  const trigByChars = t1Chars() > cfg.t1MaxChars;
+  const trigByLines = t1Lines.length >= cfg.t1MaxLines;
+  const trig = trigByChars && trigByLines ? "字数+条数"
+    : trigByChars ? `字数 ${t1Chars()}>${cfg.t1MaxChars}`
+      : trigByLines ? `条数 ${t1Lines.length}≥${cfg.t1MaxLines}` : "";
+  const repackDayFree = oldLines.length > 0 && lastRepackDay !== todayKey;
+  const shouldRepack = repackDayFree && oldChars > cfg.t1CompressTo;
+  const shouldLight = !shouldRepack && repackDayFree && oldLines.length >= cfg.t1LightLines;
+  let moved = [];
+  let what = "未超限";
+  if (shouldRepack) {
+    moved = await repackT1(oldLines);
+    what = `跨天整压（非今天 ${oldChars}→${cfg.t1CompressTo} 字）`;
+  } else if (shouldLight) {
+    moved = await repackT1(oldLines, { light: true });
+    what = `跨天轻整压（非今天 ${oldLines.length} 行 ${oldChars}→${cfg.t1LightCompressTo} 字）`;
+  } else if (t1OverLimit()) {
+    moved = evictT1OverLimit();
+    what = `摘出 ${moved.length} 行（${trig}）`;
+  }
   if (moved.length) {
     archiveEvicted(moved, reason);
     try {
@@ -695,12 +803,12 @@ ${lines.slice(0, 6000)}`;
   // ⑤ T2 双淘汰
   pruneT2();
 
-  if (t1Chars() > cfg.t1MaxChars) {
-    log(`[WARN] T1 仍超限（${t1Chars()}/${cfg.t1MaxChars} 字，${t1Lines.length} 行，保底留 ${cfg.minKeepT1} 行）`);
+  if (t1OverLimit()) {
+    log(`[WARN] T1 仍超限（${t1Chars()} 字 / ${t1Lines.length} 行，目标 ${cfg.t1CompressTo} 字 / ${cfg.t1MaxLines - 1} 行，保底留 ${cfg.minKeepT1} 行）`);
   }
 
   saveSummary();
-  log(`结算完成（${reason}）：新增 ${appended.length} 行 / 销项 ${closed} 行 / 摘出 ${moved.length} 行；T1 ${t1Lines.length} 行 ${t1Chars()} 字，T2 ${t2Lines.length} 行 ${t2Chars()} 字`);
+  log(`结算完成（${reason}）：新增 ${appended.length} 行 / 销项 ${closed} 行 / 压缩 ${what}；T1 ${t1Lines.length} 行 ${t1Chars()} 字，T2 ${t2Lines.length} 行 ${t2Chars()} 字`);
 }
 
 // 摘出的行先归档：T2 只剩骨架，摘走的细节只活在归档里（任何时候能回溯）
@@ -758,6 +866,64 @@ function fallbackMergeInto2(moved) {
     last.text = last.text.slice(0, cfg.t2MaxChars);
   }
   log(`T2 机械兜底并入 ${add.length} 行 → ${t2Lines.length} 行 ${t2Chars()} 字`);
+}
+
+// 【v1.5】跨天整压：新的一天第一次压缩，把「非今天」的行整体重压到 ≤ limit，
+// **结果留在 T1**（不是推进 T2）——这样 T1 里既有昨天一整天的收敛梗概，又保留今天的连续性。
+//   幂等：靠落盘的 lastRepackDay 判定「今天已经压过」。**绝不能**用"T1 最旧行是不是今天"
+//         来判定——整压产物的时间戳仍是非今天，那样每轮结算都会再压一次（烧钱 + 越压越薄）。
+//   失败：必须机械兜底（mechRepackToTarget 摘进 T2），绝不保留原样。
+//   opts.light：轻整压。昨天那部分没到 t1CompressTo（无料可重压）但行数多时走这条，
+//   目标改成 t1LightCompressTo，重点是**把多行并成更少的行**；产出行数没减少就视为不可用。
+// 返回：兜底时摘进 T2 的行（交给调用方并入 T2）；压缩成功返回空数组。
+async function repackT1(oldLines, opts = {}) {
+  const light = !!opts.light;
+  const limit = light ? cfg.t1LightCompressTo : cfg.t1CompressTo;
+  const keep = t1Lines.filter((l) => isTodayLine(l)); // 今天的行原样保留
+  const oldChars = oldLines.reduce((s, l) => s + l.text.length, 0);
+  const c8 = new Date(Date.now() + 8 * 3600 * 1000);
+  const cLabel = `${c8.getUTCFullYear()}年${c8.getUTCMonth() + 1}月${c8.getUTCDate()}日 ${String(c8.getUTCHours()).padStart(2, "0")}:${String(c8.getUTCMinutes()).padStart(2, "0")}`;
+  const sys = `你是记忆压缩器。只输出严格 JSON，不要任何解释或代码块围栏。
+把[要压缩的话题]整体压成更精简的话题行${light ? "（这是「轻整压」：主要目的是**减少行数**——同一天里挨着的话题并成一行）" : ""}，输出 JSON：
+{"lines":["话题行…"]}
+规则：
+1. 每条一行，开头必须是绝对时间戳（照抄原行开头的时间戳；同一天的可以合并成一行，保留该天最早的时间戳）。严禁"今天/昨天/刚才"等相对词。
+2. 这是**近期记忆**，要保住一整天的脉络：按时间顺序保留关键动作、原话、数字量词、以及还没结束的话头和待办。宁可少写细节，也不能丢掉"这一天发生过什么"的顺序。
+3. 删掉寒暄、重复和无关闲话，只留事实骨架与情绪转折；行内不要换行。
+4. 总字数不超过[字数上限]；越早的段落越简，靠后（离现在近）的可以稍详细。${light ? "\n5. 原文本来就不长，别硬砍内容：**优先合并**（把 8 行并成 2~3 行），该留的事实照留。" : ""}`;
+  const user = `[字数上限] ${limit}字（原文 ${oldChars} 字${oldChars > limit ? "，压到上限内" : "，**已在上限内，不要再删信息，只需合并行**"}）
+
+[当前时间] ${cLabel}
+
+[要压缩的话题]
+${oldLines.map((l) => l.text).join("\n")}`;
+
+  let parsed = null;
+  try {
+    const raw = await chatOnce(sys, user, { forceJson: true, kind: light ? "t1-light-repack" : "t1-repack", effort: "minimal" });
+    parsed = extractJson(raw);
+  } catch (e) {
+    log(`${light ? "跨天轻整压" : "跨天整压"}调用失败（${e.message}）`);
+  }
+  let packed = parsed && Array.isArray(parsed.lines) ? normalizeLines(parsed.lines) : [];
+  // 轻整压的产出必须真的"合并掉了行数"，否则白压一场：行数没减少就按不可用处理（走兜底）。
+  if (packed.length && light && packed.length >= oldLines.length) {
+    log(`跨天轻整压产出 ${packed.length} 行，没比原文 ${oldLines.length} 行少，视为不可用`);
+    packed = [];
+  }
+  if (!packed.length) {
+    const moved = mechRepackToTarget(limit);
+    lastRepackDay = dayKey8();
+    saveSummary();
+    log(`${light ? "跨天轻整压" : "跨天整压"}未拿到可用输出，机械兜底：把最旧的 ${moved.length} 行摘进 T2，非今天部分收到 ${limit} 字内`);
+    return moved;
+  }
+  t1Lines = packed.concat(keep); // 压缩产物都在前面（更旧），今天的行接在后面，升序不变
+  lastRepackDay = dayKey8();
+  updatedAt = new Date().toISOString();
+  saveSummary();
+  log(`${light ? "跨天轻整压" : "跨天整压"}完成：非今天 ${oldLines.length} 行 ${oldChars} 字 → ${packed.length} 行 ${packed.reduce((s, l) => s + l.text.length, 0)} 字（今天的 ${keep.length} 行原样保留）`);
+  return [];
 }
 
 function extractJson(raw) {
@@ -886,6 +1052,11 @@ function stats() {
     t1Chars: t1.length,
     t2Chars: t2.length,
     t1MaxChars: cfg.t1MaxChars,
+    t1MaxLines: cfg.t1MaxLines,                 // 【v1.5】
+    t1CompressTo: cfg.t1CompressTo,             // 【v1.5】
+    t1LightLines: cfg.t1LightLines,             // 【v1.5】
+    t1LightCompressTo: cfg.t1LightCompressTo,   // 【v1.5】
+    lastRepackDay,                              // 【v1.5】
     t2MaxChars: cfg.t2MaxChars,
     bufferCount: cfg.bufferCount,
     bufferChars: cfg.bufferChars,
@@ -895,4 +1066,4 @@ function stats() {
   };
 }
 
-module.exports = { init, observeRequest, injectBlocks, stats, snapshot, deleteRows, editRows, reloadIfChanged };
+module.exports = { init, observeRequest, injectBlocks, stats, snapshot, deleteRows, editRows, reloadIfChanged, repackT1 };
