@@ -21,6 +21,14 @@
 //   供 viewer.js 与 stats() 直接读；结构化的 t1_lines/t1_state/t2_lines 才是真源。
 //   旧的 {t1,t2} 纯字符串格式会在 loadSummary() 里自动迁移，内容不丢。
 //
+// 【v1.4 人工编辑】新增三个原语：snapshot（只读视图）/ deleteRows（按条数或按行号删）/
+//   editRows（改某一行内容）。viewer.js 的行尾小 × 与就地编辑就是调它们。
+//   跨进程改动靠 .reload 标记 + mtime 兜底自动重读；落盘改 tmp + rename 原子替换，
+//   避免另一个进程读到半截 JSON。
+// 【v1.4 修复】T2 合并失败**不再把摘出的行放回 T1**——那正是"T1 只增不减、超限静默常驻"
+//   的根因（线上四次 t2-merge 全因 thinking 烧满 max_tokens 返回空 → 行被退回 → 越滚越长）。
+//   现在合并调用关掉 thinking（reasoning_effort: minimal），失败改走机械兜底并入。
+//
 // 【重要】本模块是"防失忆"的滑动摘要，不是记忆库，也不能代替记忆库。
 //   它只保证窗口外近两天的对话还能被衔接上；更早的、需要精确检索的内容
 //   请交给专门的外置记忆库。T2 是"噪声沉降池"：它的作用之一就是让远期
@@ -36,6 +44,8 @@ const STATE_DIR = process.env.ROLLING_MEMORY_STATE_DIR || path.join(__dirname, "
 const SUMMARY_FILE = path.join(STATE_DIR, "summaries.json");
 const T1_ARCHIVE_DIR = path.join(STATE_DIR, "t1_archive");
 const FAILED_BATCH_DIR = path.join(STATE_DIR, "failed_batches");
+// 【v1.4】人工编辑后的"请重读"标记（跨进程：编辑方写完落一个，读取方看到就重读并清掉）
+const RELOAD_FLAG = path.join(STATE_DIR, ".reload");
 // 滑窗追踪上限。
 const TRACK_MAX_MSGS = 120;
 
@@ -69,6 +79,7 @@ let t1State = "";                  // T1 第 2 节「状态和心情」，每次
 let t2Lines = [];                  // T2 梗概行，**升序**，从 T1 最旧端滚下来的
 let updatedAt = null;
 let summaryState = {};             // 最近一次落盘的完整对象（含 t1/t2 字符串镜像），仅用于观测
+let loadedMtimeMs = 0;             // 上次读/写盘时 summaries.json 的 mtime（v1.4：外部改动检测）
 let lastMsgs = [];        // 上一请求的消息（内存，重启冷启动）
 let pending = [];         // 滑出待结算缓冲 [{role, text, fp}]
 let pendingFps = new Set();
@@ -229,9 +240,13 @@ function migrateLegacy(parsed) {
   return { t1_lines: t1, t1_state: state, t2_lines: splitByDate(t2str) };
 }
 
+function touchMtime() {
+  try { loadedMtimeMs = fs.statSync(SUMMARY_FILE).mtimeMs; } catch { loadedMtimeMs = 0; }
+}
+
 function loadSummary() {
   try {
-    if (!fs.existsSync(SUMMARY_FILE)) return;
+    if (!fs.existsSync(SUMMARY_FILE)) { loadedMtimeMs = 0; return; }
     const parsed = JSON.parse(fs.readFileSync(SUMMARY_FILE, "utf8"));
     if (Array.isArray(parsed.t1_lines) || Array.isArray(parsed.t2_lines)) {
       t1Lines = normalizeLines(parsed.t1_lines);
@@ -249,9 +264,43 @@ function loadSummary() {
       log(`已从旧 string 格式迁移：T1 ${t1Lines.length} 条 / T2 ${t2Lines.length} 条（内容保留，未压缩）`);
       saveSummary();
     }
+    touchMtime();
   } catch (e) {
     log("摘要文件读取失败，用空状态启动:", e.message);
   }
+}
+
+// 【v1.4】外部改动自动重读：viewer（另一个进程）直接改 summaries.json 后，
+// 本进程内存里还是旧态 → 注入的仍是旧的。三条判据按可靠性排序：
+//   ① 标记文件（可靠）：编辑原语写完顺手落一个 .reload，读到就重读并清掉；
+//   ② mtime（兜底）：手工在服务器上直接改文件（不经接口）也能被捞到；
+//   ③ 结算前 loadSummary()：兜住"刚好卡在重读之前"的窗口。
+// 为什么不能只靠 mtime：NTFS/Node 的 mtimeMs 只有 ~1ms 粒度，同一毫秒内的两次写入
+// 时间戳完全相同（实测过），"改完立刻读"会静默读到旧态——正是这个功能最常走的路径。
+function reloadIfChanged() {
+  try {
+    if (fs.existsSync(RELOAD_FLAG)) {
+      try { fs.unlinkSync(RELOAD_FLAG); } catch { /* 清不掉也无妨，下次再试 */ }
+      log("检测到外部改动标记，重读摘要");
+      loadSummary();
+      return true;
+    }
+    if (!fs.existsSync(SUMMARY_FILE)) return false;
+    if (fs.statSync(SUMMARY_FILE).mtimeMs === loadedMtimeMs) return false;
+    log("检测到 summaries.json 的 mtime 变化，重读摘要");
+    loadSummary();
+    return true;
+  } catch (e) {
+    log("外部改动重读失败(忽略):", e.message);
+    return false;
+  }
+}
+
+function markExternalChange() {
+  try {
+    fs.mkdirSync(STATE_DIR, { recursive: true });
+    fs.writeFileSync(RELOAD_FLAG, String(Date.now()));
+  } catch (e) { log("写重读标记失败(忽略):", e.message); }
 }
 
 function saveSummary() {
@@ -266,8 +315,106 @@ function saveSummary() {
       t2: renderT2(),
       updated_at: updatedAt,
     };
-    fs.writeFileSync(SUMMARY_FILE, JSON.stringify(summaryState, null, 1));
+    // 【v1.4】改成 tmp + rename 原子替换：viewer 与本进程都可能改这个文件，
+    // 直接 writeFileSync 有被另一个进程读到半截 JSON 的风险（读到就静默回旧态）。
+    const tmp = SUMMARY_FILE + ".tmp";
+    fs.writeFileSync(tmp, JSON.stringify(summaryState, null, 1));
+    fs.renameSync(tmp, SUMMARY_FILE);
+    touchMtime();
   } catch (e) { log("摘要保存失败(忽略):", e.message); }
+}
+
+// ========================
+// 人工编辑原语（v1.4）
+//   需求：「滚动记忆做个接口，能按条数删，还能改具体内容」+ 查看器每行一个小 ×。
+//   调用方：viewer.js 的 POST /api/ledger（也可以由使用者自己的面板/网关直接 require 调用），
+//   改的就是真源 summaries.json。
+//   下标语义：一律**升序**（0 = 最旧），与内部存储一致；T1 渲染时「最新在前」是显示层的事，
+//   调用方要自己翻，否则删错行。
+//   改完立刻落盘（原子替换）；另一个进程靠 reloadIfChanged() 自动重读，不需要通知。
+// ========================
+function view() {
+  return {
+    t1: renderT1(),
+    t2: renderT2(),
+    t1_lines: t1Lines.map((l) => ({ ts: l.ts, text: l.text })),
+    t2_lines: t2Lines.map((l) => ({ ts: l.ts, text: l.text })),
+    t1_state: t1State,
+    t1_chars: t1Chars(),
+    t2_chars: t2Chars(),
+    limits: { t1_max_chars: cfg.t1MaxChars, t2_max_chars: cfg.t2MaxChars, t2_max_days: cfg.t2MaxDays },
+    updated_at: updatedAt,
+  };
+}
+
+// 只读快照：先重读磁盘（另一个进程可能刚改过），再回视图
+function snapshot() {
+  loadSummary();
+  return view();
+}
+
+function rowsOf(target) {
+  const t = String(target || "t1").trim().toLowerCase();
+  if (t === "t1") return t1Lines;
+  if (t === "t2") return t2Lines;
+  if (t === "state") return null;
+  throw new Error("target 只能是 t1 / t2 / state");
+}
+
+// 删：给了 index 删那一行（查看器的小 × 走这条）；没给就按 count 从**最旧端**删（默认 1 条）。
+function deleteRows(target, opts = {}) {
+  loadSummary();
+  const t = String(target || "t1").trim().toLowerCase();
+  // index 是"删哪一行"，与"从最旧端删几条"必须严格区分：给了但给歪了（"abc"）要报错，
+  // 绝不能落进 count 分支去删最旧的行——那是静默删错。
+  const hasIndex = opts.index !== undefined && opts.index !== null && opts.index !== "";
+  const index = hasIndex ? Number(opts.index) : null;
+  if (index !== null && !Number.isInteger(index)) throw new Error(`index 必须是整数（收到 ${JSON.stringify(opts.index)}）`);
+  const count = Math.max(1, Math.min(Number(opts.count) || 1, 999));
+  let removed = [];
+  if (t === "state") {
+    if (!t1State) throw new Error(`「${cfg.userLabel}的状态和心情」本来就是空的`);
+    removed = [t1State];
+    t1State = "";
+  } else {
+    const list = rowsOf(t);
+    if (!list.length) throw new Error(`${t.toUpperCase()} 没有可删的行`);
+    if (index !== null) {
+      if (index < 0 || index >= list.length) throw new Error(`行号 ${index} 超出范围（共 ${list.length} 行，下标从 0 起）`);
+      removed = list.splice(index, 1);
+    } else {
+      removed = list.splice(0, Math.min(count, list.length));
+    }
+  }
+  updatedAt = new Date().toISOString();
+  saveSummary();
+  markExternalChange(); // 通知另一个进程重读（它的内存态靠这个才知道变了）
+  log(`人工删除：${t} ${removed.length} 条 → ${removed.map((r) => (typeof r === "string" ? r : r.text)).join(" | ").slice(0, 120)}`);
+  return view();
+}
+
+// 改：整条替换。行内不换行（一行一条话题）；若改完丢了开头的日期，用原时间戳补回去——
+// 时间戳是 tsOf() 从正文现算的，丢了这行就再匹配不上 close、也逃过 T2 日期淘汰。
+function editRows(target, index, text) {
+  loadSummary();
+  const t = String(target || "t1").trim().toLowerCase();
+  let body = String(text == null ? "" : text).trim().replace(/\s*\n+\s*/g, " ");
+  if (!body) throw new Error("内容不能为空（想删就用小 ×）");
+  if (t === "state") {
+    t1State = body;
+  } else {
+    const list = rowsOf(t);
+    const i = Number(index);
+    if (!Number.isInteger(i) || i < 0 || i >= list.length) throw new Error(`行号 ${index} 超出范围（共 ${list.length} 行，下标从 0 起）`);
+    const old = list[i];
+    if (!tsOf(body) && old.ts) body = `${old.ts}：${body}`;
+    list[i] = makeLine(body);
+  }
+  updatedAt = new Date().toISOString();
+  saveSummary();
+  markExternalChange();
+  log(`人工编辑：${t}${index == null ? "" : "[" + index + "]"} → ${body.slice(0, 120)}`);
+  return view();
 }
 
 // ========================
@@ -537,9 +684,11 @@ ${lines.slice(0, 6000)}`;
     try {
       await mergeInto2(moved);
     } catch (e) {
-      // 合并失败：把行放回 T1 最旧端，内容不丢，下一轮结算再试
-      t1Lines = moved.concat(t1Lines);
-      log(`T2 合并失败（${e.message}），${moved.length} 行已放回 T1，下轮重试`);
+      // 【v1.4 根因修复】合并失败**不再把行放回 T1**——那正是"T1 只增不减、超限静默常驻"的根因：
+      // 线上四次 t2-merge 全部因 thinking 烧满 max_tokens 返回空 → 行被放回 → T1 越滚越长。
+      // 现在改走机械兜底：代码自己按行拼接 + 按字数淘汰，内容不丢（细节另有 t1_archive 归档）。
+      log(`T2 合并失败（${e.message}），改走机械兜底并入（不再退回 T1）`);
+      fallbackMergeInto2(moved);
     }
   }
 
@@ -587,7 +736,7 @@ ${renderT2() || "（无）"}
 
 [并入的话题]
 ${moved.map((l) => l.text).join("\n")}`;
-  const raw = await chatOnce(sys, user, { forceJson: true, kind: "t2-merge" });
+  const raw = await chatOnce(sys, user, { forceJson: true, kind: "t2-merge", effort: "minimal" });
   const parsed = extractJson(raw);
   if (!parsed || !Array.isArray(parsed.lines)) throw new Error("T2 合并输出无法解析");
   const merged = normalizeLines(parsed.lines);
@@ -595,6 +744,20 @@ ${moved.map((l) => l.text).join("\n")}`;
   // 摘出的行已从 T1 删除，与 T2 不再重叠 → 整体替换；日期/字数淘汰由 pruneT2() 统一做
   t2Lines = merged;
   log(`T2 已并入 ${moved.length} 行 → ${t2Lines.length} 行 ${t2Chars()} 字`);
+}
+
+// 【v1.4】机械兜底：模型拿不回来时，代码自己把摘出的行原样接到 T2 尾部，
+// 超字数由 pruneT2 从最旧端丢——宁可"梗概不那么精炼"，也不能让行退回去把 T1 顶爆。
+function fallbackMergeInto2(moved) {
+  const add = normalizeLines(moved);
+  t2Lines = t2Lines.concat(add);
+  pruneT2();
+  if (t2Chars() > cfg.t2MaxChars && t2Lines.length) {
+    // 只剩 1 行时 pruneT2 保底不删（length > 1 才删），这里硬截一下，别让上限失真
+    const last = t2Lines[t2Lines.length - 1];
+    last.text = last.text.slice(0, cfg.t2MaxChars);
+  }
+  log(`T2 机械兜底并入 ${add.length} 行 → ${t2Lines.length} 行 ${t2Chars()} 字`);
 }
 
 function extractJson(raw) {
@@ -614,6 +777,7 @@ function extractJson(raw) {
 // ========================
 function injectBlocks() {
   if (!cfg.enabled) return [];
+  reloadIfChanged(); // 【v1.4】外部（查看器的编辑按钮）改过 summaries.json 就重读，改完下一轮即生效
   const blocks = [];
   try {
     const t1 = renderT1();
@@ -660,6 +824,11 @@ async function chatOnce(systemPrompt, userPrompt, opts = {}) {
       stream: false,
     };
     if (opts.forceJson) body.response_format = { type: "json_object" };
+    // 【v1.4】reasoning_effort：官方上游实测接受 minimal/low/medium/high 四档。
+    // t2-merge 传 minimal——它是纯机械压缩，不需要思考，而实测 thinking 会烧满 max_tokens
+    // 把 content 挤成空（线上四次 t2-merge 全部 completion=8192 / reasoning=8192 → 内容空）。
+    // 不传就保持上游默认，老上游不认这个字段也无妨（有的会直接忽略）。
+    if (opts.effort) body.reasoning_effort = opts.effort;
     const resp = await fetch(cfg.apiBase, {
       method: "POST",
       headers: { "Content-Type": "application/json", Authorization: `Bearer ${cfg.apiKey}` },
@@ -726,4 +895,4 @@ function stats() {
   };
 }
 
-module.exports = { init, observeRequest, injectBlocks, stats };
+module.exports = { init, observeRequest, injectBlocks, stats, snapshot, deleteRows, editRows, reloadIfChanged };

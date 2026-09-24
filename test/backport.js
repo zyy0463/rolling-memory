@@ -143,7 +143,9 @@ t("evictT1OverLimit 保底留 minKeepT1 行", () => {
   assert.ok(/t1Lines\.length > cfg\.minKeepT1/.test(SRC));
 });
 t("合并 prompt 要求保留绝对时间戳、禁相对词、能独立读懂", () => {
-  const seg = SRC.slice(SRC.indexOf("async function mergeInto2"), SRC.indexOf("t2-merge"));
+  // 注意：切片终点要用 `kind: "t2-merge"`（函数内的实参），不能用裸 "t2-merge"——
+  // 顶部注释里也提到过 t2-merge，裸串会命中到函数之前，切出空段。
+  const seg = SRC.slice(SRC.indexOf("async function mergeInto2"), SRC.indexOf('kind: "t2-merge"'));
   assert.ok(/绝对时间戳/.test(seg));
   assert.ok(/严禁"今天\/昨天"等相对词/.test(seg));
   assert.ok(/能独立读懂/.test(seg));
@@ -388,6 +390,67 @@ t(".env.example 含双上游变量与 v1.3 新变量", () => {
 });
 t(".env.example 解释了多开 Key 不等于提额度", () => {
   assert.ok(/并发.*按【账号】计|按【账号】计/.test(ENVEX));
+});
+
+console.log("\n[12] v1.4：人工编辑原语 + 外部改动重读 + 原子落盘 + T2 合并兜底");
+const VIEWER_SRC = fs.readFileSync(path.join(__dirname, "..", "viewer.js"), "utf8");
+t("编辑原语与导出齐全", () => {
+  for (const fn of ["view", "snapshot", "rowsOf", "deleteRows", "editRows"]) {
+    assert.ok(new RegExp(`function ${fn}\\(`).test(SRC), `缺函数 ${fn}`);
+  }
+  assert.ok(/module\.exports = \{[^}]*snapshot[^}]*deleteRows[^}]*editRows[^}]*\}/.test(SRC), "导出应含编辑原语");
+});
+t("index 语义严格区分：给歪了报错，绝不静默改从最旧端删", () => {
+  assert.ok(/Number\.isInteger\(index\)/.test(SRC), "index 应做整数校验");
+  assert.ok(/index 必须是整数/.test(SRC));
+  assert.ok(/function rowsOf\(target\)/.test(SRC) && /target 只能是 t1 \/ t2 \/ state/.test(SRC));
+});
+t("按条数删是从最旧端删（splice(0, count)）", () => {
+  assert.ok(/list\.splice\(0, Math\.min\(count, list\.length\)\)/.test(SRC));
+});
+t("改内容丢了开头的日期会自动补回原时间戳", () => {
+  assert.ok(/if \(!tsOf\(body\) && old\.ts\) body = `\$\{old\.ts\}：\$\{body\}`;/.test(SRC));
+});
+t("外部改动重读：.reload 标记为主 + mtime 兜底", () => {
+  assert.ok(/RELOAD_FLAG = path\.join\(STATE_DIR, "\.reload"\)/.test(SRC));
+  assert.ok(/function reloadIfChanged\(\)/.test(SRC));
+  assert.ok(/function markExternalChange\(\)/.test(SRC));
+  assert.ok(/fs\.statSync\(SUMMARY_FILE\)\.mtimeMs === loadedMtimeMs/.test(SRC), "应有 mtime 兜底判据");
+  const i = SRC.indexOf("function injectBlocks");
+  assert.ok(/reloadIfChanged\(\);/.test(SRC.slice(i, i + 200)), "注入前应先检查外部改动");
+  assert.ok(/markExternalChange\(\);\n?/.test(SRC.slice(SRC.indexOf("function deleteRows"), SRC.indexOf("function init"))), "编辑原语写完应落标记");
+});
+t("落盘是 tmp + rename 原子替换", () => {
+  assert.ok(/const tmp = SUMMARY_FILE \+ "\.tmp"/.test(SRC));
+  assert.ok(/fs\.renameSync\(tmp, SUMMARY_FILE\)/.test(SRC));
+});
+t("t2-merge 关 thinking，失败改机械兜底（不再退回 T1）", () => {
+  assert.ok(/kind: "t2-merge", effort: "minimal"/.test(SRC), "t2-merge 应传 effort=minimal");
+  assert.ok(/if \(opts\.effort\) body\.reasoning_effort = opts\.effort;/.test(SRC));
+  assert.ok(/function fallbackMergeInto2\(moved\)/.test(SRC));
+  assert.ok(!/t1Lines = moved\.concat\(t1Lines\)/.test(SRC), "不得再把摘出的行退回 T1（T1 只增不减的根因）");
+});
+t("viewer 暴露 POST /api/ledger + 行尾小 × 与就地编辑", () => {
+  assert.ok(/url === "\/api\/ledger"/.test(VIEWER_SRC));
+  assert.ok(/action === "delete"/.test(VIEWER_SRC) && /action === "edit"/.test(VIEWER_SRC));
+  assert.ok(/rolling\.deleteRows\(/.test(VIEWER_SRC) && /rolling\.editRows\(/.test(VIEWER_SRC));
+  assert.ok(/class="x"/.test(VIEWER_SRC), "应有行尾小 ×");
+  assert.ok(/action:"edit",target:t,index:t==="state"\?undefined:i/.test(VIEWER_SRC), "状态块改时不该传 index");
+});
+t("viewer 渲染 T1 用升序下标（显示倒序，删的必须是对的哪一行）", () => {
+  assert.ok(/data-i="/.test(VIEWER_SRC) && /getAttribute\("data-i"\)/.test(VIEWER_SRC), "行上应带升序下标");
+  assert.ok(/for\(var i=a\.length-1;i>=0;i--\)/.test(VIEWER_SRC), "显示应倒序");
+});
+t("package.json 版本为 1.4.0", () => {
+  const pkg = JSON.parse(fs.readFileSync(path.join(__dirname, "..", "package.json"), "utf8"));
+  assert.strictEqual(pkg.version, "1.4.0");
+});
+t("README 写了 v1.4 的编辑能力与 T2 合并兜底", () => {
+  assert.ok(/deleteRows/.test(README) && /editRows/.test(README) && /api\/ledger/.test(README));
+  assert.ok(/小 ×/.test(README));
+  assert.ok(/不再把摘出的行退回 T1|不再退回/.test(README));
+  assert.ok(/reasoning_effort/.test(README));
+  assert.ok(/v1\.4/.test(README));
 });
 
 // 清理
