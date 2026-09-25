@@ -1,7 +1,8 @@
 // test/backport.js — 开源版（rolling-memory）回归测试
 // 覆盖本轮回灌的功能：条数触发、sha256 指纹、重复消息、后台请求检测、
 // v1.3 行列表滚动（append/close/state）、机械淘汰（evictT1OverLimit/pruneT2）、
-// 解析失败重试、旧格式迁移、归档、双上游解析、用量观测。
+// 解析失败重试、旧格式迁移、归档、双上游解析、用量观测、
+// v1.5 压缩策略 / v1.6 注入块优先级声明 / v1.7 结算粒度改「时段」。
 // 运行：node test/backport.js（端到端另见 test/rolling.test.js）
 const fs = require("fs");
 const path = require("path");
@@ -533,9 +534,9 @@ t("运行时行为：init() 后新字段可读且是默认值", () => {
   assert.strictEqual(s.t1LightCompressTo, 400);
   assert.strictEqual(typeof rolling.repackT1, "function", "应导出 repackT1");
 });
-t("package.json 版本为 1.6.0", () => {
+t("package.json 版本为 1.7.0", () => {
   const pkg = JSON.parse(fs.readFileSync(path.join(__dirname, "..", "package.json"), "utf8"));
-  assert.strictEqual(pkg.version, "1.6.0");
+  assert.strictEqual(pkg.version, "1.7.0");
 });
 t("README 写了 v1.5 的压缩策略（两条触发 / 跨天整压 / 轻整压）", () => {
   assert.ok(/v1\.5/.test(README));
@@ -604,6 +605,52 @@ t("README 有「和外置记忆库一起用」一节 + 可抄的补充 prompt", 
   assert.ok(/长期记忆库是长期事实的权威来源/.test(README), "应给出可抄的补充 prompt");
   assert.ok(/抢掉了/.test(README), "应引用使用者的原始反馈");
   assert.ok(/v1\.6/.test(README));
+});
+
+console.log("\n[15] v1.7：结算粒度改「时段」+ 触发日志 + settle 关 thinking");
+t("结算 prompt 的 append 规则改成「时段」粒度（不是一回合一行）", () => {
+  assert.ok(/粒度是【时段】不是【一回合】/.test(SRC), "应有「时段 vs 一回合」的显式口径");
+  assert.ok(/合并/.test(SRC), "应说明要合并连续相关的话");
+  assert.ok(/9\.25日 20:30—22:00/.test(SRC), "应给出时段范围时间戳的示例");
+  assert.ok(/半小时以上/.test(SRC), "应给出「隔多久才另起一行」的判据");
+  assert.ok(/每 30 条消息一般只出 3~5 条/.test(SRC), "应给出密度参考");
+  assert.ok(/50~120 字/.test(SRC), "每条的厚度应改成 50~120 字");
+});
+t("prompt 里旧口径「一行一个话题 / 40~90 字」已删除（否则模型照旧写碎行）", () => {
+  // 只看结算 prompt 本身：更新记录/注释里会引用旧口径作对照，不能连它们一起否掉
+  const i = SRC.indexOf("const sys = `你是记忆压缩器");
+  const seg = SRC.slice(i, i + 2500);
+  assert.ok(i > 0, "找不到结算 prompt");
+  assert.ok(!/一行一个话题/.test(seg), "prompt 里不应残留「一行一个话题」");
+  assert.ok(!/40~90 字/.test(seg), "prompt 里不应残留「40~90 字」");
+});
+t("close 兼容时段行（叫模型填开头那截）", () => {
+  assert.ok(/行首若是时段/.test(SRC), "close 规则应说明时段行怎么填");
+});
+t("runCycle 打「结算触发」并分清条数网 / 字数网", () => {
+  const i = SRC.indexOf("async function runCycle(reason)");
+  const seg = SRC.slice(i, i + 1400);
+  assert.ok(/结算触发（\$\{which\}）/.test(seg), "应打出是哪个网触发的");
+  assert.ok(/const byCount = batch\.length >= cfg\.bufferCount/.test(seg), "应按批次真实条数回判条数网");
+  assert.ok(/const byChars = batchChars >= cfg\.bufferChars/.test(seg), "应按批次真实字数回判字数网");
+  assert.ok(/本批 \$\{batch\.length\} 条 \/ \$\{batchChars\} 字/.test(seg), "应打出本批条数与字数");
+  assert.ok(/const batchChars = batch\.reduce/.test(seg), "batchChars 应在清空 pending 之前算好");
+});
+t("settle / settle-retry 都传 reasoning_effort: minimal", () => {
+  assert.ok(/kind: "settle", effort: "minimal"/.test(SRC), "settle 应传 minimal");
+  assert.ok(/kind: "settle-retry", effort: "minimal"/.test(SRC), "settle-retry 也应传 minimal");
+  assert.ok(/kind: "t2-merge", effort: "minimal"/.test(SRC), "t2-merge 的 minimal 不应被误删");
+});
+t("README 同步：摘要格式段换口径 + 更新记录写 v1.7 + 抬 bufferCount 治不了粒度", () => {
+  assert.ok(/粒度是【时段】不是【一回合】/.test(README), "README 摘要格式段应换口径");
+  assert.ok(/50~120 字/.test(README), "README 应写新的每条厚度");
+  assert.ok(/v1\.7/.test(README), "更新记录应有 v1.7");
+  assert.ok(/治不了这个病/.test(README), "应写明「抬 bufferCount 治不了粒度」");
+  // 摘要格式段（append 那段说明）里不该再出现旧厚度口径；更新记录里引用旧口径作对照是允许的
+  const i = README.indexOf("append：本批新话题行");
+  const seg = README.slice(i, i + 900);
+  assert.ok(i > 0, "找不到摘要格式段");
+  assert.ok(!/40~90 字/.test(seg), "摘要格式段不应残留旧厚度口径");
 });
 
 // 清理

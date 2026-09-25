@@ -47,6 +47,18 @@
 //   注意：README 开头那段"不能代替记忆库"是写给**装的人**看的，模型根本看不到——
 //   所以必须在注入块里补一段给**模型**看的（就是下面这段声明）。
 //
+// 【v1.7 结算粒度改"时段"】使用者反馈："开了滚动记忆以后几乎每一句都被记下来了"。
+//   查证结论：**结算频率是正常的**（门槛按条数走，一天也就结算几次），
+//   真正的毛病是**每行太碎**——旧 prompt 写的是"一行一个话题…每条 40~90 字"，
+//   模型于是把"一次你来我往"当成了一个话题，一批 30 条消息能写 8~11 行，看着就像句句都在记。
+//   现改为**一行一个"时段"**：同一场连着聊的合并成一行、时间戳写成范围（9.25日 20:30—22:00），
+//   并给出密度参考（每 30 条消息一般只出 3~5 行）。
+//   ⚠️ 抬 bufferCount 治不了这个病：门槛只决定"多久调一次模型"，不决定"每次写多细"；
+//   每批多攒几条，模型就多写两三行，**全天总行数几乎不变**。要控粒度只能改 prompt 口径。
+//   · 顺带两处：runCycle 打「结算触发（条数/字数）：本批 N 条」——原来条数与字数两个网
+//     都报 threshold，日志里分不清是谁触发的；settle 加 reasoning_effort:"minimal"
+//     （与 t2-merge 同款，防 thinking 烧满 max_tokens 把 content 挤空后白跑一批）。
+//
 // 【重要】本模块是"防失忆"的滑动摘要，不是记忆库，也不能代替记忆库。
 //   它只保证窗口外近两天的对话还能被衔接上；更早的、需要精确检索的内容
 //   请交给专门的外置记忆库。T2 是"噪声沉降池"：它的作用之一就是让远期
@@ -655,8 +667,24 @@ function scheduleCycle(reason) {
 
 async function runCycle(reason) {
   const batch = pending;
+  const batchChars = batch.reduce((s, m) => s + m.text.length, 0);
   pending = [];
   pendingFps = new Set();
+  // 【v1.7】条数与字数两个网都报 threshold，日志里分不清是谁触发的。
+  // 这里按批次的真实规模回判，并顺手打出批次条数——"是不是每句都在结算"靠这一行证伪。
+  if (batch.length) {
+    if (reason === "threshold") {
+      const byCount = batch.length >= cfg.bufferCount;
+      const byChars = batchChars >= cfg.bufferChars;
+      const which = byCount && byChars
+        ? `条数 ${batch.length}≥${cfg.bufferCount} + 字数 ${batchChars}≥${cfg.bufferChars}`
+        : byCount ? `条数 ${batch.length}≥${cfg.bufferCount}`
+          : `字数 ${batchChars}≥${cfg.bufferChars}`;
+      log(`结算触发（${which}）：本批 ${batch.length} 条 / ${batchChars} 字`);
+    } else {
+      log(`结算触发（${reason}）：本批 ${batch.length} 条 / ${batchChars} 字`);
+    }
+  }
   try {
     await settleBatch(batch, reason);
   } catch (e) {
@@ -707,9 +735,15 @@ async function settleBatch(batch, reason) {
 {"append":["新话题行…"],"state":"${cfg.userLabel}此刻的状态和心情","close":["旧行的起始时间戳…"]}
 
 规则：
-1. append：每条一行，开头必须是绝对时间戳（格式如 9.23日 09:10；按[当前时间]回推换算相对时间词），严禁出现"今天/昨天/刚才/今晚/上午"等相对词。一行一个话题，行内不要换行。关键动作、原话、数字量词（"第五轮""气过两回""九点半"）都要写足，每条 40~90 字。约定、待办、没聊完的话头也写成话题行。没有值得记的新内容就输出空数组。
+1. append：每条一行，开头必须是绝对时间戳（格式如 9.23日 09:10；按[当前时间]回推换算相对时间词），严禁出现"今天/昨天/刚才/今晚/上午"等相对词。行内不要换行。
+   粒度是【时段】不是【一回合】——把同一段时间里连续相关的一串话**合并**成一条，不要你来我往一次就写一条：
+   · 时间戳写成时段范围：这串话从几点聊到几点，如「9.25日 20:30—22:00」（只隔几分钟就写单个时刻）。
+   · 合并判据：同一场连着聊的天、同一个话题、同一件事的来回报备，都算一条。只有话题真的换了、或中间隔了半小时以上没说话，才另起一行。
+   · 每条要把这一串的**脉络**写清（怎么起的→关键动作/原话→落点），关键动作、原话、数字量词（"第五轮""气过两回""九点半"）写足，每条 50~120 字。
+   · 密度参考：[新对话] 每 30 条消息一般只出 3~5 条。宁可少而厚，不要多而碎。
+   约定、待办、没聊完的话头也写成话题行。没有值得记的新内容就输出空数组。
 2. 不要重复[近期摘要]里已经写过的事——只有真的新发生、有新进展才开新行。
-3. close：只填[近期摘要]里**已经明确结束**的事（待办做完了、约定履行了、话题有结论了），填那一行的起始时间戳（照抄[近期摘要]里该行开头的时间戳，如 9.22日 19:45）。没结束的不要填，拿不准就不填。待办一旦完成必须 close 掉，不许一直挂着。
+3. close：只填[近期摘要]里**已经明确结束**的事（待办做完了、约定履行了、话题有结论了），填那一行的**起始时间戳**——行首若是时段（如 9.25日 20:30—22:00），填开头那截就行（9.25日 20:30）。没结束的不要填，拿不准就不填。待办一旦完成必须 close 掉，不许一直挂着。
 4. state：只留最新——体力、情绪、正在忙什么（有没有不舒服、在学习还是在玩、心情如何），开头带检查时刻的时间戳。`;
 
   const user = `[当前时间] ${nowLabel}
@@ -720,14 +754,17 @@ ${t1Text}
 [新对话]
 ${lines.slice(0, 6000)}`;
 
-  let raw = await chatOnce(sys, user, { forceJson: true, kind: "settle" });
+  // 【v1.7】settle 也传 minimal：实测 thinking 会先吃满 max_tokens（默认 4000）把 content 挤空，
+  // 白跑一整批再进重试（与 t2-merge 同病，那条 v1.4 已传 minimal）。这是抽取+按规则归并的活，
+  // 不靠长思考；若日后发现摘要质量下降，把这里抬到 "low" 即可（别直接删，删了空稿会回来）。
+  let raw = await chatOnce(sys, user, { forceJson: true, kind: "settle", effort: "minimal" });
   let parsed = extractJson(raw);
   if (!parsed) {
     // 【v1.3】解析失败与上游故障性质不同：这批消息最可能就此永久消失（runCycle 已清空 pending，
     // 返回值被忽略）。先原地重试一次（同样的输入，成本可接受），仍失败才归档落盘。
     log(`结算输出无法解析（${reason}），重试一次…`);
     try {
-      raw = await chatOnce(sys, user, { forceJson: true, kind: "settle-retry" });
+      raw = await chatOnce(sys, user, { forceJson: true, kind: "settle-retry", effort: "minimal" });
       parsed = extractJson(raw);
     } catch (e) { log("结算重试失败:", e.message); }
   }
