@@ -91,9 +91,21 @@ t("结算 prompt 只输出 {append, state, close} 三字段", () => {
   );
   assert.ok(/append/.test(TPL) && /close/.test(TPL) && /state/.test(TPL));
 });
-t("prompt 含待办销项语义（已结束/不许一直挂着）", () => {
-  assert.ok(/已经明确结束/.test(TPL), "close 规则应说明只填已结束的事");
-  assert.ok(/不许一直挂着/.test(TPL), "应要求完成的待办必须销项");
+t("prompt 只许销「待办/约定」行，话题行不许 close（v1.8）", () => {
+  assert.ok(/只能销「待办 \/ 约定」类的行/.test(TPL), "close 应限定为「待办/约定」类");
+  assert.ok(/一律不许 close/.test(TPL), "话题行应明确一律不许 close");
+  assert.ok(/不是\*\* close 的理由/.test(TPL), "应写明「有结论了/聊完了」不是理由");
+  assert.ok(/一次最多销 1~2 行/.test(TPL), "应给出销项数量上限");
+  assert.ok(/真的办完了要销掉/.test(TPL), "应说明完成的待办仍要销项");
+  assert.ok(!/话题有结论了/.test(TPL), "旧口径「话题有结论了」不得残留在结算 prompt 里");
+});
+t("close 有代码护栏：保底行数 + 不得超过本批新增（v1.8）", () => {
+  assert.ok(/const hits = new Set\(t1Lines\.filter\(\(l\) => matchesClose\(l, closeList\)\)\)/.test(SRC),
+    "应先算原始命中行（供日志与截断判断）");
+  assert.ok(/Math\.max\(0, Math\.min\(before - cfg\.minKeepT1, appended\.length\)\)/.test(SRC),
+    "可销额度 = min(保底余量, 本批新增)");
+  assert.ok(/close 被护栏拦下/.test(SRC), "应能记录「被拦下」");
+  assert.ok(/close 被护栏截断/.test(SRC), "应能记录「被截断」");
 });
 t("强制绝对时间戳、禁止相对词", () => {
   assert.ok(/绝对时间戳/.test(SRC));
@@ -534,9 +546,9 @@ t("运行时行为：init() 后新字段可读且是默认值", () => {
   assert.strictEqual(s.t1LightCompressTo, 400);
   assert.strictEqual(typeof rolling.repackT1, "function", "应导出 repackT1");
 });
-t("package.json 版本为 1.7.0", () => {
+t("package.json 版本为 1.8.0", () => {
   const pkg = JSON.parse(fs.readFileSync(path.join(__dirname, "..", "package.json"), "utf8"));
-  assert.strictEqual(pkg.version, "1.7.0");
+  assert.strictEqual(pkg.version, "1.8.0");
 });
 t("README 写了 v1.5 的压缩策略（两条触发 / 跨天整压 / 轻整压）", () => {
   assert.ok(/v1\.5/.test(README));

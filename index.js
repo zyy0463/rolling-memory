@@ -13,7 +13,7 @@
 //   ② T1 一超限就把整段压成 T2 后清空——近 24h 的细节瞬间塌掉；
 //   ③ T2 只有"被重写"一条更新路径，**没有淘汰**，很旧的梗概能一直活到几个月后；
 //   ④ 待办只写不核，完成的事没人销项，一直挂着。
-// 现在：结算只输出**新增行**（append）+ 已结束旧行的时间戳（close）+ 状态节（state）；
+// 现在：结算只输出**新增行**（append）+ 已结束的**待办/约定**行的时间戳（close）+ 状态节（state）；
 //   超限时从最旧端**机械摘行**（按字数摘到 ≤ 上限），交给一次小调用并入 T2；
 //   T2 按**日期（默认 7 天）+ 字数**双淘汰，最旧的直接丢，不再永久保留。
 //
@@ -58,6 +58,20 @@
 //   · 顺带两处：runCycle 打「结算触发（条数/字数）：本批 N 条」——原来条数与字数两个网
 //     都报 threshold，日志里分不清是谁触发的；settle 加 reasoning_effort:"minimal"
 //     （与 t2-merge 同款，防 thinking 烧满 max_tokens 把 content 挤空后白跑一批）。
+//
+// 【v1.8 close 收紧为"只销待办/约定" + 两道代码护栏】使用者反馈："信息丢失了好多"——
+//   T1 从一整天掉到只剩 2 行。查证：与长度压缩无关（压缩日志全是「未超限」），
+//   真因是 **close 销项**：旧 prompt 把"话题有结论了"也算"已明确结束"，模型于是按天清算话题，
+//   一天里销了 4/4/8/5 行，其中两次把 T1 销到 **0 行**。而 close 是直接 filter 删行，
+//   **删掉的行不进 T2、不留档**（T2 只接"超限机械摘行"那条路）⇒ 等于永久删除。
+//   且 close 原先**完全不受 minKeepT1 保护**（那只保护 evictT1OverLimit）。
+//   现在：① prompt 只许销「待办/约定」行，话题行一律不许 close（它们由超限机械滚进 T2），
+//   "有结论了/聊完了/已经过去了"明确写为不是理由，一次最多 1~2 行；
+//   ② 代码硬拦两道——可销额度 = max(0, min(T1行数 - minKeepT1, 本批 append 行数))，
+//   即"销售后不得低于保底行数"且"一次销项不得超过本批新增"（本批零新增则一行都不许销），
+//   拦下/截断都打日志。
+//   ⚠️ 提醒：close 的语义是**删除**，不是"归档"。如果你需要"销项也要留痕"，
+//   请自己把 closed 的行另存一份（本模块不提供该落盘，故意保持最小实现）。
 //
 // 【重要】本模块是"防失忆"的滑动摘要，不是记忆库，也不能代替记忆库。
 //   它只保证窗口外近两天的对话还能被衔接上；更早的、需要精确检索的内容
@@ -706,7 +720,8 @@ async function runCycle(reason) {
 // ========================
 // 结算（v1.3 行列表版）：一次 LLM 调用产出 {append, state, close}
 //   ① append：本批新话题行，push 进 T1 尾部（升序）
-//   ② close ：[近期摘要]里**已结束**的旧行时间戳，按 ts 前缀删行（待办销项）
+//   ② close ：[近期摘要]里**已结束的「待办/约定」行**的时间戳，按 ts 前缀删行
+//             （v1.8 收紧 + 双护栏，见下方 ② 处注释：话题行一律不许销）
 //   ③ state ：第 2 节整体重写（短，不参与淘汰）
 //   ④ T1 超限 → 从最旧端机械摘行 → 一次小调用并入 T2（不再整段重写/清空）
 //   ⑤ T2 双淘汰：日期过期（t2MaxDays）+ 超字数
@@ -743,7 +758,10 @@ async function settleBatch(batch, reason) {
    · 密度参考：[新对话] 每 30 条消息一般只出 3~5 条。宁可少而厚，不要多而碎。
    约定、待办、没聊完的话头也写成话题行。没有值得记的新内容就输出空数组。
 2. 不要重复[近期摘要]里已经写过的事——只有真的新发生、有新进展才开新行。
-3. close：只填[近期摘要]里**已经明确结束**的事（待办做完了、约定履行了、话题有结论了），填那一行的**起始时间戳**——行首若是时段（如 9.25日 20:30—22:00），填开头那截就行（9.25日 20:30）。没结束的不要填，拿不准就不填。待办一旦完成必须 close 掉，不许一直挂着。
+3. close：**只能销「待办 / 约定」类的行**——那一行明确写着"要做 / 答应过 / 等回话 / 还没做完"的事，并且这批对话里真的做完了、履行完了，才填它的**起始时间戳**（行首若是时段如 9.25日 20:30—22:00，填开头那截就行：9.25日 20:30）。真的办完了要销掉，别一直挂着。
+   · 普通「聊了什么」的话题行**一律不许 close**——哪怕这件事已经过去、有结论、当天聊完了，也不填。它们不归你销：T1 装不下时由系统自己把最旧的行滚进 T2。
+   · "有结论了 / 聊完了 / 已经过去了"**不是** close 的理由；只有"答应他的那件事办完了"才是。
+   · 一次最多销 1~2 行。没有就输出空数组 []。拿不准就不填。
 4. state：只留最新——体力、情绪、正在忙什么（有没有不舒服、在学习还是在玩、心情如何），开头带检查时刻的时间戳。`;
 
   const user = `[当前时间] ${nowLabel}
@@ -784,15 +802,37 @@ ${lines.slice(0, 6000)}`;
   const appended = normalizeLines(parsed.append);
   for (const l of appended) t1Lines.push(l);
 
-  // ② close：待办销项 / 已结束话题删行
+  // ② close：只销「待办 / 约定」类的旧行
+  // 【v1.8 加护栏 · 根因】模型曾把 close 当成"清理已结束的话题"用：一天里四次大销项
+  //   （4/4/8/5 行，其中两次把 T1 销到 0 行），近两天二十来行话题就此消失。而且 close 是
+  //   直接 filter 删行——**删掉的行不进 T2、不留档**（T2 只接"超限机械摘行"那条路），等于永久删除。
+  //   且 close 原先**完全不受 minKeepT1 保护**（那只保护 evictT1OverLimit），可以销到 0 行。
+  //   两条护栏（prompt 收紧之外再加硬拦）：
+  //     ① 销售后 T1 不得低于 minKeepT1 行；
+  //     ② 一次销项不得超过本批 append 的行数——真待办结项总伴随"这件事办完了"的新行，
+  //        只有"批量清算旧话题"才会出现零新增却销一大片。
   const closeList = (Array.isArray(parsed.close) ? parsed.close : []).map((c) => String(c || "").trim()).filter(Boolean);
   let closed = 0;
   if (closeList.length) {
     const before = t1Lines.length;
-    t1Lines = t1Lines.filter((l) => !matchesClose(l, closeList));
-    closed = before - t1Lines.length;
-    if (closed) log(`已销项 ${closed} 行（close: ${closeList.join(" / ")}）`);
-    else log(`close 未命中任何行（close: ${closeList.join(" / ")}）`);
+    const hits = new Set(t1Lines.filter((l) => matchesClose(l, closeList)));
+    const quota = Math.max(0, Math.min(before - cfg.minKeepT1, appended.length));
+    if (quota <= 0) {
+      log(`close 被护栏拦下，一行未销（命中 ${hits.size} 行；可销额度 0 = min(保底留 ${cfg.minKeepT1} 行 → ${Math.max(0, before - cfg.minKeepT1)}, 本批新增 ${appended.length})；close: ${closeList.join(" / ")}）`);
+    } else {
+      const remove = new Set();
+      let left = quota;
+      for (const l of t1Lines) {           // 从最旧端销，与 T1 淘汰方向一致
+        if (left <= 0) break;
+        if (hits.has(l)) { remove.add(l); left--; }
+      }
+      t1Lines = t1Lines.filter((l) => !remove.has(l));
+      closed = remove.size;
+      if (closed < hits.size) {
+        log(`close 被护栏截断：命中 ${hits.size} 行，可销额度 ${quota} → 只销 ${closed} 行（保底留 ${cfg.minKeepT1} 行 / 本批新增 ${appended.length} 行）`);
+      }
+      log(`已销项 ${closed} 行（close: ${closeList.join(" / ")}）`);
+    }
   }
 
   // ③ state：整体重写
