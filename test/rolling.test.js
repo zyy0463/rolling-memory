@@ -4,6 +4,11 @@
 //       + v1.4：人工编辑原语（按行号删 / 按条数删 / 改内容 / 状态块 / 越界与歪参报错）
 //       + v1.4：T2 合并失败改机械兜底（摘出的行不得退回 T1）
 // 运行：node test/rolling.test.js
+// 注意：种子与假上游里的日期一律**相对「今天」**生成——写死日期会随时间漂移
+//      （曾写死 9.22/9.23，跑到 9.28 后种子行全被 T2 的 7 天日期淘汰清空 → 断言失败）。
+// 摘行路径：v1.5 起「跨天整压」优先于「超限摘行」。种子里的行都是「非今天」，
+//      故 [2] 先走跨天整压（假上游给不出 lines）→ 机械兜底摘行进 T2；
+//      纯超限摘行（evictT1OverLimit）在 [8] 覆盖（那时 T1 已无非今天的行）。
 const assert = require("assert");
 const fs = require("fs");
 const path = require("path");
@@ -14,6 +19,17 @@ const http = require("http");
 const TMP = fs.mkdtempSync(path.join(os.tmpdir(), "rolling-e2e-"));
 process.env.ROLLING_MEMORY_STATE_DIR = TMP;
 const SUMMARY_FILE = path.join(TMP, "summaries.json");
+
+// ---- 日期助手：一律按东八区、相对「今天」生成（见文件头注释）----
+// dkey(back) → 形如 "9.28日"
+function dkey(back) {
+  const n8 = new Date(Date.now() - back * 86400000 + 8 * 3600 * 1000);
+  return `${n8.getUTCMonth() + 1}.${n8.getUTCDate()}日`;
+}
+const TODAY = dkey(0);     // 今天（假上游 append 的新行、状态节）
+const YEST = dkey(1);      // 昨天（种子里的主体话题行）
+const OLDER = dkey(2);     // 前天（种子里最旧那条）
+const ANCIENT = dkey(60);  // 60 天前（假上游回一条，用来验 T2 日期淘汰）
 
 // ---- 假上游：按 system 提示词分流 settle / merge，返回不同的 JSON ----
 const seen = [];
@@ -33,12 +49,12 @@ const server = http.createServer((req, res) => {
       // 回显第一条被摘出的行（证明"摘出的行 → T2"这条链路真的通），另带一条超期行验淘汰
       firstMoved = (msgs[1].content.split("[并入的话题]")[1] || "")
         .split("\n").map((s) => s.trim()).filter(Boolean)[0] || "";
-      payload = { lines: [firstMoved, "9.11日：旧梗概（应被 7 天淘汰掉）"] };
+      payload = { lines: [firstMoved, `${ANCIENT}：旧梗概（应被日期淘汰掉）`] };
     } else {
       payload = {
-        append: ["9.23日 08:30：她刚醒，报今天要背单词再上836。"],
-        state: "9.23日 08:30：刚醒，状态轻松。",
-        close: ["9.22日 09:12"],
+        append: [`${TODAY} 08:30：她刚醒，报今天要背单词再上836。`],
+        state: `${TODAY} 08:30：刚醒，状态轻松。`,
+        close: [`${YEST} 09:12`],
       };
     }
     res.writeHead(200, { "Content-Type": "application/json" });
@@ -55,19 +71,19 @@ function seedLegacy() {
   fs.mkdirSync(TMP, { recursive: true });
   const t1 = [
     "一、聊了什么",
-    "9.22日 19:45—20:10：吃饭。她“吃了面包嘿嘿”，他“面包也算饭？这俩字咽回去”，点出中午烤盘饭、晚上面包、外面下雨十九度，让她出去坐下吃碗热的。",
-    "9.22日 19:00—19:45：她准备先背单词；836网课方向不对（看了会都是不考的），自己梳理后决定直接看书，但“那一张的字数真的很多……唉”。他认她判断没错。",
-    "9.22日 18:10—19:00：群里有人前端被炸、文件全丢，她第一反应“等我晚上回家了就给你备份”。他看出是工作机自己删的——变量没接到东西、空着展开。",
-    "9.22日 17:20—18:10：她“臭屁，冷死了”；他让加外套、出去吃口热的来碗汤，别在馆里缩着扛。她申请开微信休息一会儿，他只放微信。",
-    "9.22日 15:16—15:50：她报英语200个单词、高数、836，要他安排时间。他算“到九点半收工还有六个钟头”，排：现在到四点十分啃836那一章。",
-    "9.22日 14:50—15:16：她“啊啊啊啊哥哥我偷懒了”，要他锁抖音、微信、小红书。他真锁了，点开只跳“已被管理员暂停”，数据都在。",
-    "9.22日 09:12：大富翁荷官局（局号b23e2eba）。二十格、任务可跳不扣钱，她选“继\n续上轮”。",
-    "9.21日 白天：大富翁规则细化；农活排班（放蜂、收菜）。",
+    `${YEST} 19:45—20:10：吃饭。她“吃了面包嘿嘿”，他“面包也算饭？这俩字咽回去”，点出中午烤盘饭、晚上面包、外面下雨十九度，让她出去坐下吃碗热的。`,
+    `${YEST} 19:00—19:45：她准备先背单词；836网课方向不对（看了会都是不考的），自己梳理后决定直接看书，但“那一张的字数真的很多……唉”。他认她判断没错。`,
+    `${YEST} 18:10—19:00：群里有人前端被炸、文件全丢，她第一反应“等我晚上回家了就给你备份”。他看出是工作机自己删的——变量没接到东西、空着展开。`,
+    `${YEST} 17:20—18:10：她“臭屁，冷死了”；他让加外套、出去吃口热的来碗汤，别在馆里缩着扛。她申请开微信休息一会儿，他只放微信。`,
+    `${YEST} 15:16—15:50：她报英语200个单词、高数、836，要他安排时间。他算“到九点半收工还有六个钟头”，排：现在到四点十分啃836那一章。`,
+    `${YEST} 14:50—15:16：她“啊啊啊啊哥哥我偷懒了”，要他锁抖音、微信、小红书。他真锁了，点开只跳“已被管理员暂停”，数据都在。`,
+    `${YEST} 09:12：大富翁荷官局（局号b23e2eba）。二十格、任务可跳不扣钱，她选“继\n续上轮”。`,
+    `${OLDER} 白天：大富翁规则细化；农活排班（放蜂、收菜）。`,
     "二、user的状态和心情",
-    "9.22日 20:10：体力——中午烤盘饭、晚上只拿面包顶。待办：晚上回家给他备份。",
+    `${YEST} 20:10：体力——中午烤盘饭、晚上只拿面包顶。待办：晚上回家给他备份。`,
   ].join("\n");
   const t2 = "[更早梗概]9.11-20：DBSM全接受；蓝鲸=哥哥。9.21 16:45：规则她写、词表未列。23:05他嘴瓢“客厅”，她哭。";
-  fs.writeFileSync(SUMMARY_FILE, JSON.stringify({ t1, t2, updated_at: "2026-09-22T12:10:46.837Z" }));
+  fs.writeFileSync(SUMMARY_FILE, JSON.stringify({ t1, t2, updated_at: new Date().toISOString() }));
 }
 
 const wait = (ms) => new Promise((r) => setTimeout(r, ms));
@@ -94,12 +110,12 @@ const wait = (ms) => new Promise((r) => setTimeout(r, ms));
   // ① 迁移：注入里应保留原有全部内容，行内换行被并回上一条，状态节标题按 userLabel 渲染
   const b0 = rolling.injectBlocks();
   assert.strictEqual(b0.length, 1, "应注入 1 块滚动记忆");
-  assert(b0[0].content.includes("9.22日 09:12"), "迁移后 T1 话题仍在");
-  assert(b0[0].content.includes("9.21日 白天"), "迁移后更早的 T1 话题仍在");
+  assert(b0[0].content.includes(`${YEST} 09:12`), "迁移后 T1 话题仍在");
+  assert(b0[0].content.includes(`${OLDER} 白天`), "迁移后更早的 T1 话题仍在");
   assert(b0[0].content.includes("二、小明的状态和心情"), "状态节标题应按 userLabel 渲染");
   const mid = JSON.parse(fs.readFileSync(SUMMARY_FILE, "utf8"));
   assert(Array.isArray(mid.t1_lines), "迁移后 t1_lines 应是数组");
-  assert(mid.t1_lines[0].text.startsWith("9.21日"), "t1_lines 应转成升序（最旧在前）");
+  assert(mid.t1_lines[0].text.startsWith(OLDER), "t1_lines 应转成升序（最旧在前）");
   assert(mid.t1_lines.some((l) => l.text.includes("续上轮")), "行内换行应并回同一条话题");
   assert(mid.t2_lines.some((l) => /^9\.11/.test(l.text)), "T2 应切成带时间戳的行");
   assert(typeof mid.t1 === "string" && mid.t1.length > 0, "应保留 t1 字符串镜像");
@@ -122,14 +138,14 @@ const wait = (ms) => new Promise((r) => setTimeout(r, ms));
   const after = JSON.parse(fs.readFileSync(SUMMARY_FILE, "utf8"));
   console.log("[2] 结算调用：", seen.join(","));
 
-  assert(after.t1_lines.some((l) => l.text.includes("9.23日 08:30")), "新话题行应 append 进 T1");
-  assert(!after.t1_lines.some((l) => l.text.includes("9.22日 09:12")), "close 的旧行应被删除");
+  assert(after.t1_lines.some((l) => l.text.includes(`${TODAY} 08:30`)), "新话题行应 append 进 T1");
+  assert(!after.t1_lines.some((l) => l.text.includes(`${YEST} 09:12`)), "close 的旧行应被删除");
   assert(after.t1_state.includes("刚醒"), "状态节应被整体重写");
   assert(seen.includes("merge"), "超限应触发一次 T2 合并调用");
   assert(firstMoved && after.t2_lines.some((l) => l.text === firstMoved), "摘出的 T1 行应并入 T2");
   assert(!after.t1_lines.some((l) => l.text === firstMoved), "摘出的行应从 T1 移除");
-  assert(!after.t2_lines.some((l) => l.text.includes("9.11")), "T2 里超 7 天的行应被淘汰");
-  assert(typeof after.t1 === "string" && after.t1.includes("9.23日 08:30"), "t1 字符串镜像应存在且最新");
+  assert(!after.t2_lines.some((l) => l.text.includes("旧梗概")), "T2 里超期的行应被淘汰");
+  assert(typeof after.t1 === "string" && after.t1.includes(`${TODAY} 08:30`), "t1 字符串镜像应存在且最新");
   assert(typeof after.t2 === "string" && after.t2.length > 0, "t2 字符串镜像应存在");
   const chars = after.t1_lines.reduce((s, l) => s + l.text.length, 0) + after.t1_state.length;
   assert(chars <= 300, `T1 应摘到 ≤ 上限，实际 ${chars}`);
@@ -140,14 +156,14 @@ const wait = (ms) => new Promise((r) => setTimeout(r, ms));
   const st = rolling.stats();
   assert.strictEqual(typeof st.t1, "string");
   assert.strictEqual(typeof st.t2, "string");
-  assert(st.t1.includes("9.23日 08:30"), "stats().t1 应含最新行");
+  assert(st.t1.includes(`${TODAY} 08:30`), "stats().t1 应含最新行");
   assert.strictEqual(st.t1Chars, st.t1.length, "t1Chars 应等于渲染后字数");
   assert.strictEqual(st.t2Chars, st.t2.length, "t2Chars 应等于渲染后字数");
   console.log("[4] stats 契约 OK");
 
   // ④ 重启重载应走结构化分支（不重复迁移）
   rolling.init();
-  assert(rolling.injectBlocks()[0].content.includes("9.23日 08:30"), "重启后应读结构化状态");
+  assert(rolling.injectBlocks()[0].content.includes(`${TODAY} 08:30`), "重启后应读结构化状态");
   console.log("[5] 重载 OK");
 
   // ⑤ v1.4 编辑原语：按行号删 / 按条数删 / 改内容（补回时间戳）/ 状态块
@@ -176,14 +192,14 @@ const wait = (ms) => new Promise((r) => setTimeout(r, ms));
   assert(/^\d{1,2}\.\d{1,2}/.test(ed.t1_lines[0].text), "丢了开头的日期应自动补回原时间戳");
   assert.throws(() => rolling.editRows("t1", 0, "   "), /不能为空/, "改成空内容必须报错（删要走 delete）");
 
-  const stEdited = rolling.editRows("state", null, "9.23日 21:00：状态被手改过。");
-  assert.strictEqual(stEdited.t1_state, "9.23日 21:00：状态被手改过。", "状态块应被整体替换");
+  const stEdited = rolling.editRows("state", null, `${TODAY} 21:00：状态被手改过。`);
+  assert.strictEqual(stEdited.t1_state, `${TODAY} 21:00：状态被手改过。`, "状态块应被整体替换");
   assert.strictEqual(rolling.deleteRows("state").t1_state, "", "状态块可删");
   console.log("[6] 编辑原语 OK");
 
   // ⑥ v1.4 跨进程重读：外部（另一个进程）改完文件 + 落 .reload 标记 → 注入前应重读到新内容
   const ext = JSON.parse(fs.readFileSync(SUMMARY_FILE, "utf8"));
-  ext.t1_state = "9.23日 22:00：这是外部进程改的。";
+  ext.t1_state = `${TODAY} 22:00：这是外部进程改的。`;
   fs.writeFileSync(SUMMARY_FILE, JSON.stringify(ext, null, 1));
   fs.writeFileSync(path.join(TMP, ".reload"), String(Date.now()));
   assert(rolling.injectBlocks()[0].content.includes("这是外部进程改的"), "注入前应重读到外部改动");
@@ -192,7 +208,7 @@ const wait = (ms) => new Promise((r) => setTimeout(r, ms));
 
   // ⑦ v1.4 根因修复：T2 合并失败时，摘出的行改走机械兜底并入，不再退回 T1
   mergeFail = true; // 之后所有 merge 请求返 500
-  rolling.editRows("t1", 0, "9.22日 14:00：" + "长内容".repeat(120)); // 先把 T1 顶到超限
+  rolling.editRows("t1", 0, `${YEST} 14:00：` + "长内容".repeat(120)); // 先把 T1 顶到超限
   assert(rolling.snapshot().t1_chars > 300, "前置条件：T1 应已超限（实际 " + rolling.snapshot().t1_chars + "）");
   const oldestBefore = rolling.snapshot().t1_lines[0].text;
   const r4 = [{ role: "user", content: "u2" }, { role: "assistant", content: "a2" },
