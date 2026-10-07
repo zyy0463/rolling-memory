@@ -1,5 +1,9 @@
 # rolling-memory — 两层滚动记忆
 
+<a href="https://github.com/DasterProkio/awesome-ai-companion/blob/main/README.zh-CN.md">
+  <img src="https://raw.githubusercontent.com/DasterProkio/awesome-ai-companion/main/assets/featured-in-awesome-ai-companion-zh-CN.png" alt="已收录于人机恋开源项目大全" width="400">
+</a>
+
 解决对话客户端只有有限消息窗口（比如只保留最近 19 句）导致的"失忆"：
 滑出窗口的消息被异步结算成摘要，每次请求自动注入回上下文，LLM 永远知道"之前聊过什么"。
 
