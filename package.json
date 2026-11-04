@@ -1,15 +1,16 @@
 {
   "name": "rolling-memory",
-  "version": "1.8.0",
-  "description": "两层滚动记忆：滑出对话窗口的消息自动结算成 T1 近期摘要 + T2 远期梗概，每次请求自动注入回 LLM 上下文",
+  "version": "1.9.0",
+  "description": "两层滚动记忆：滑出对话窗口的消息自动结算成 T1 近期摘要 + T2 远期梗概，每次请求自动注入回 LLM 上下文；v1.9 起按会话隔离，换对话模型、多会话并行都不会串味",
   "main": "index.js",
   "scripts": {
     "proxy": "node proxy.js",
     "view": "node viewer.js",
-    "test": "node test/backport.js && node test/rolling.test.js && node test/close-guard.js"
+    "test": "node test/backport.js && node test/rolling.test.js && node test/close-guard.js && node test/sessions.js",
+    "bench:sessions": "node _bench_sessions.js on && node _bench_sessions.js off"
   },
   "license": "MIT",
   "engines": { "node": ">=18" },
-  "keywords": ["llm", "memory", "context-window", "summarization", "gateway", "chatbot"],
-  "files": ["index.js", "proxy.js", "viewer.js", "env.js", "README.md", "LICENSE", ".env.example"]
+  "keywords": ["llm", "memory", "context-window", "summarization", "gateway", "chatbot", "multi-session", "model-switch"],
+  "files": ["index.js", "proxy.js", "viewer.js", "env.js", "README.md", "LICENSE", ".env.example", "docs/", "scripts/"]
 }

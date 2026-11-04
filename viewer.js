@@ -1,8 +1,9 @@
 // viewer.js — 迷你查看器 + 记忆编辑：npm run view → http://127.0.0.1:8788
 // 展示 T1/T2 当前内容、字数、待结算缓冲；每行一个小 × 直接删，点文字就地改。
-// 改的是真源 state/summaries.json（走 index.js 的 deleteRows/editRows，原子落盘），
-// 结算进程下一轮注入前会自动重读（.reload 标记），无需重启。
+// 改的是真源（默认会话 = state/summaries.json，其它会话 = state/sessions/<id>.json），
+// 走 index.js 的 deleteRows/editRows 原子落盘，结算进程下一轮注入前会自动重读（.reload 标记），无需重启。
 // 【v1.4】编辑接口就是 POST /api/ledger，字段与 index.js 的原语一一对应，脚本也能直接调。
+// 【v1.9】顶部多了会话下拉：多会话隔离后，每个会话是一份独立记忆，可以分开看、分开改。
 // 只监听本机、无鉴权——别把这个端口暴露到公网。
 const http = require("http");
 const { loadDotEnv } = require("./env");
@@ -28,8 +29,15 @@ const HTML = `<!doctype html>
  .edit{width:100%;box-sizing:border-box;font:inherit;font-size:13px;line-height:1.6;padding:6px;border:1px solid #9bc;border-radius:6px;resize:vertical}
  .acts{margin-top:6px} .acts button{font-size:12px;margin-right:6px;padding:3px 10px;border-radius:6px;border:1px solid #9bc;background:#eef5fc;cursor:pointer}
  .err{color:#c0392b;font-size:12px;min-height:16px}
+ select{font:inherit;font-size:13px;padding:3px 8px;border-radius:6px;border:1px solid #9bc;background:#f7fbff;max-width:100%}
+ .top{display:flex;gap:10px;align-items:center;flex-wrap:wrap;margin:10px 0}
 </style></head><body>
 <h1>rolling-memory 查看器 <span class="muted">每 5 秒自动刷新</span></h1>
+<div class="top">
+  <span class="muted">会话</span>
+  <select id="sess"><option value="">（加载中）</option></select>
+  <span class="muted" id="sessinfo"></span>
+</div>
 <div class="muted" id="meta"></div>
 <div class="err" id="err"></div>
 <div class="card"><h2>T2 远期梗概 <span class="muted" id="t2n"></span></h2>
@@ -38,8 +46,10 @@ const HTML = `<!doctype html>
  <div class="bar"><i id="t1b"></i></div><div id="t1"></div></div>
 <div class="card"><h2>结算流水线</h2><pre id="pipe"></pre></div>
 <p class="muted">每行末尾的 × 删掉这一行，点文字就地改（回车外的换行会被压平、丢了开头的日期会自动补回原时间戳）。编辑中不参与自动刷新；改完立即落盘，结算进程下一轮自动重读。</p>
+<p class="muted">会话下拉：每个会话是一份**独立**的记忆。换模型时新开了对话 = 这里会多一行；点开可以分别看、分别改，互不影响。</p>
 <script>
 var editing=false;
+var cur=localStorage.getItem("rm_session")||"default";
 function esc(s){return String(s==null?"":s).replace(/&/g,"&amp;").replace(/</g,"&lt;").replace(/>/g,"&gt;");}
 function rowHtml(t,i,text){
  return '<div class="row" data-t="'+t+'" data-i="'+i+'"><span class="txt" title="点一下就地改">'+esc(text)+'</span>'
@@ -51,17 +61,39 @@ function linesHtml(t,arr){
  for(var i=a.length-1;i>=0;i--) h+=rowHtml(t,i,a[i].text);
  return h||'<div class="muted">（空）</div>';
 }
+function qs(extra){var p="session="+encodeURIComponent(cur);return extra?p+"&"+extra:p;}
 async function api(payload){
+ payload.sessionId=cur;
  var r=await fetch("/api/ledger",{method:"POST",headers:{"content-type":"application/json"},body:JSON.stringify(payload)});
  var j={}; try{j=await r.json();}catch(e){}
  if(!r.ok||j.ok===false) throw new Error((j&&j.error)||("HTTP "+r.status));
  return j;
 }
+async function loadSessions(){
+ try{
+  var j=await (await fetch("/api/sessions")).json();
+  var all=j.sessions||[];
+  var sel=document.getElementById("sess");
+  var html="";
+  for(var i=0;i<all.length;i++){
+   var s=all[i];
+   var label=(s.id==="default"?"默认会话":"自动 · "+s.id.slice(0,14))
+     +(s.pending?" · 待结算 "+s.pending:"")
+     +(s.updated_at?" · "+String(s.updated_at).replace("T"," ").slice(5,16):"");
+   html+='<option value="'+esc(s.id)+'">'+esc(label)+'</option>';
+  }
+  if(!all.some(function(x){return x.id===cur;})) { html+='<option value="'+esc(cur)+'">'+esc(cur)+'（空）</option>'; }
+  sel.innerHTML=html||'<option value="default">默认会话</option>';
+  sel.value=cur;
+  document.getElementById("sessinfo").textContent=all.length>1?("共 "+all.length+" 个会话"):"";
+ }catch(e){}
+}
 async function tick(){
  if(editing) return;
  try{
-  var s=await (await fetch("/api/state")).json();
-  document.getElementById("meta").textContent="模型: "+(s.model||"未配置")+" · 开关: "+(s.enabled?"开":"关")+" · 摘要更新于: "+(s.updated_at||"从未");
+  loadSessions();
+  var s=await (await fetch("/api/state?"+qs())).json();
+  document.getElementById("meta").textContent="当前会话: "+(s.session||cur)+" · 模型: "+(s.model||"未配置")+" · 开关: "+(s.enabled?"开":"关")+" · 摘要更新于: "+(s.updated_at||"从未");
   document.getElementById("t2").innerHTML=linesHtml("t2",s.t2_lines);
   var t1=linesHtml("t1",s.t1_lines);
   if(s.t1_state) t1+='<div class="muted" style="margin-top:8px">状态与心情</div>'+rowHtml("state","",s.t1_state);
@@ -75,6 +107,9 @@ async function tick(){
  }catch(e){}
 }
 function fail(e){document.getElementById("err").textContent=String(e&&e.message||e);}
+document.getElementById("sess").addEventListener("change",function(ev){
+ cur=ev.target.value||"default"; localStorage.setItem("rm_session",cur); tick();
+});
 document.getElementById("t1").addEventListener("click",onClick);
 document.getElementById("t2").addEventListener("click",onClick);
 async function onClick(ev){
@@ -122,10 +157,21 @@ function sendJson(res, code, obj) {
 function start({ port } = {}) {
   const p = port || Number(process.env.VIEWER_PORT) || 8788;
   const server = http.createServer(async (req, res) => {
-    const url = (req.url || "").split("?")[0];
+    const [url, queryStr] = (req.url || "").split("?");
+    const q = new URLSearchParams(queryStr || "");
+    const sid = q.get("session") || ""; // 空 = 用当前绑定的会话
+    if (url === "/api/sessions") {
+      sendJson(res, 200, { sessions: rolling.listSessions(), current: sid || null });
+      return;
+    }
     if (url === "/api/state") {
       // stats() 给运行态（模型/开关/缓冲），snapshot() 给行列表；后者覆盖同名字段
-      sendJson(res, 200, { ...rolling.stats(), ...rolling.snapshot() });
+      // 不带 session 参数时固定看默认会话——不能用"当前绑定"，那是进程内的临时状态，
+      // 多开两个页面就会互相把对方带跑。
+      const useId = sid || rolling.DEFAULT_SESSION;
+      const st = rolling.stats(useId);
+      const sn = rolling.snapshot(useId);
+      sendJson(res, 200, { ...st, ...sn });
       return;
     }
     if (url === "/api/ledger" && req.method === "POST") {
@@ -133,8 +179,8 @@ function start({ port } = {}) {
       if (!b) return sendJson(res, 400, { ok: false, error: "请求体不是合法 JSON" });
       try {
         let view;
-        if (b.action === "delete") view = rolling.deleteRows(b.target, { index: b.index, count: b.count });
-        else if (b.action === "edit") view = rolling.editRows(b.target, b.index, b.text);
+        if (b.action === "delete") view = rolling.deleteRows(b.target, { index: b.index, count: b.count, sessionId: b.sessionId });
+        else if (b.action === "edit") view = rolling.editRows(b.target, b.index, b.text, b.sessionId);
         else return sendJson(res, 400, { ok: false, error: "action 只能是 delete / edit" });
         sendJson(res, 200, { ok: true, ...view });
       } catch (e) {

@@ -86,6 +86,11 @@ const crypto = require("crypto");
 
 const STATE_DIR = process.env.ROLLING_MEMORY_STATE_DIR || path.join(__dirname, "state");
 const SUMMARY_FILE = path.join(STATE_DIR, "summaries.json");
+// 【v1.9】多会话隔离：非默认会话的摘要落在这里，一个会话一个文件。
+// 默认会话**仍然用 summaries.json**——这样单会话用户升级到 v1.9 什么都不用做，
+// 文件位置、查看器、人工编辑接口全都不变。
+const SESSION_DIR = path.join(STATE_DIR, "sessions");
+const DEFAULT_SESSION = "default";
 const T1_ARCHIVE_DIR = path.join(STATE_DIR, "t1_archive");
 const FAILED_BATCH_DIR = path.join(STATE_DIR, "failed_batches");
 // 【v1.4】人工编辑后的"请重读"标记（跨进程：编辑方写完落一个，读取方看到就重读并清掉）
@@ -115,6 +120,9 @@ const DEFAULTS = {
   llmTimeoutMs: 60000,
   userLabel: "user",        // 结算摘要里"对方"的称呼
   assistantLabel: "assistant", // 结算摘要里"自己"的称呼
+  // 【v1.9】多会话隔离
+  sessionIsolation: true,   // 关掉则所有请求共用 default（= v1.8 行为）
+  maxSessions: 8,           // 最多同时保留几个会话的内存态（超出淘汰最久未用的）
 };
 
 let cfg = { ...DEFAULTS };
@@ -134,6 +142,156 @@ let pending = [];         // 滑出待结算缓冲 [{role, text, fp}]
 let pendingFps = new Set();
 let busy = false;
 let rerunNeeded = false;
+
+// ========================
+// 【v1.9】多会话隔离
+// ------------------------------------------------------------
+// 要解决的问题（都是实测出来的，不是想出来的）：
+//   ① 两个会话交替发请求时，overlap 恒为 0 → 都被判成"换窗"，于是 A 说一句、
+//      B 说一句，两边都往**同一份**摘要里倒，39 个结算批次里 12 条消息被重复结算 2~4 次。
+//   ② 换对话模型时客户端新开了会话（历史不带过来）→ 同样被当成"换窗"，
+//      旧会话整个窗口被当"滑出"结算进摘要，两件不相干的事就串成了一条时间线。
+// 根因不是换窗逻辑写错了，是**只有一份摘要**，所有窗口都在往里面挤。
+//
+// 做法：给每个会话一份独立状态，请求进来先认领会话，再走原来的滑窗逻辑。
+//   · 会话怎么认：优先用调用方显式给的 id（网关可传 header）；没有就看**窗口重叠**——
+//     同一个会话里客户端一定会把历史带上（不带就没法对话），所以 overlap>0 是可靠的同会话信号；
+//     overlap=0 就说明真的是另一个会话/另一个窗口，开新槽，而不是把旧窗口倒进当前摘要。
+//   · 全局变量怎么隔离：不重写全部函数，改成"绑定式"——全局变量始终代表**当前绑定的会话**，
+//     换会话时把值收回去再摊开新的（project/harvest）。JS 单线程，同步块内不会被打断，
+//     所以只要在每个 await 之后重新绑定一次，异步结算也不会串到别人身上。
+//   · 向后兼容：默认会话就落在原来的 summaries.json，老用户升级后行为、文件、接口全不变。
+// ========================
+const sessions = new Map(); // id -> session object
+let curS = null;            // 当前绑定（全局变量此刻代表谁）
+
+function blankSession(id) {
+  return {
+    id,
+    // —— 以下与模块级全局变量一一对应，靠 project/harvest 搬运 ——
+    t1Lines: [], t1State: "", t2Lines: [],
+    updatedAt: null, summaryState: {}, loadedMtimeMs: 0, lastRepackDay: null,
+    lastMsgs: [], pending: [], pendingFps: new Set(),
+    busy: false, rerunNeeded: false,
+    // —— 会话管理 ——
+    lastSeen: 0,
+  };
+}
+
+// 把会话的值摊到全局变量上
+function projectSession(s) {
+  t1Lines = s.t1Lines;
+  t1State = s.t1State;
+  t2Lines = s.t2Lines;
+  updatedAt = s.updatedAt;
+  summaryState = s.summaryState;
+  loadedMtimeMs = s.loadedMtimeMs;
+  lastRepackDay = s.lastRepackDay;
+  lastMsgs = s.lastMsgs;
+  pending = s.pending;
+  pendingFps = s.pendingFps;
+  busy = s.busy;
+  rerunNeeded = s.rerunNeeded;
+}
+
+// 把全局变量的当前值收回到会话对象上。
+// 必须做这一步：代码里大量 `t1Lines = t1Lines.filter(...)` 这类**重新赋值**，
+// 不收回的话会话对象还攥着旧数组，下次切回来就回退了。
+function harvestSession(s) {
+  s.t1Lines = t1Lines;
+  s.t1State = t1State;
+  s.t2Lines = t2Lines;
+  s.updatedAt = updatedAt;
+  s.summaryState = summaryState;
+  s.loadedMtimeMs = loadedMtimeMs;
+  s.lastRepackDay = lastRepackDay;
+  s.lastMsgs = lastMsgs;
+  s.pending = pending;
+  s.pendingFps = pendingFps;
+  s.busy = busy;
+  s.rerunNeeded = rerunNeeded;
+}
+
+// 会话 id 消毒：只留安全字符，防路径穿越（id 会变成文件名）
+function sanitizeSessionId(raw) {
+  const s = String(raw == null ? "" : raw).trim();
+  if (!s) return DEFAULT_SESSION;
+  const safe = s.replace(/[^A-Za-z0-9_-]/g, "").slice(0, 40);
+  return safe || DEFAULT_SESSION;
+}
+
+function summaryFileOf(id) {
+  return id === DEFAULT_SESSION ? SUMMARY_FILE : path.join(SESSION_DIR, id + ".json");
+}
+
+// 绑定到一个会话：没有就建（并从盘上读），有就切。
+// 冷启动时 sessions 是空的，这一步会把上次的记忆读回来。
+function bindSession(rawId) {
+  const id = sanitizeSessionId(rawId);
+  let s = sessions.get(id);
+  if (s) {
+    if (s !== curS) {
+      if (curS) harvestSession(curS);
+      curS = s;
+      projectSession(s);
+    }
+    s.lastSeen = Date.now();
+    return s;
+  }
+  s = blankSession(id);
+  sessions.set(id, s);
+  if (curS) harvestSession(curS);
+  curS = s;
+  projectSession(s);
+  loadSummary(); // 此时已绑定，读的是这个会话自己的文件
+  s.lastSeen = Date.now();
+  pruneSessions();
+  return s;
+}
+
+// 会话数量上限：淘汰最久没动静、且没有待结算缓冲的（有缓冲说明还有话没记完，不能扔）
+function pruneSessions() {
+  const max = Math.max(1, cfg.maxSessions);
+  if (sessions.size <= max) return;
+  const idle = [...sessions.values()]
+    .filter((s) => s.id !== DEFAULT_SESSION && s !== curS && s.pending.length === 0 && !s.busy)
+    .sort((a, b) => a.lastSeen - b.lastSeen);
+  let over = sessions.size - max;
+  for (const s of idle) {
+    if (over <= 0) break;
+    sessions.delete(s.id);
+    over--;
+    log(`会话 ${s.id} 超过上限 ${max}，已从内存卸载（磁盘文件保留，下次用到会重新读）`);
+  }
+}
+
+// 磁盘上最近写过的那个会话（冷启动时用来决定"第一个请求属于谁"）
+function mostRecentSessionId() {
+  let best = null, bestAt = -1;
+  const consider = (id, at) => {
+    const t = at ? Date.parse(at) : 0;
+    if (Number.isFinite(t) && t > bestAt) { bestAt = t; best = id; }
+  };
+  for (const s of sessions.values()) consider(s.id, s.updatedAt);
+  try {
+    if (fs.existsSync(SUMMARY_FILE)) {
+      const j = JSON.parse(fs.readFileSync(SUMMARY_FILE, "utf8"));
+      consider(DEFAULT_SESSION, j.updated_at);
+    }
+  } catch { /* 坏文件当没有 */ }
+  try {
+    if (fs.existsSync(SESSION_DIR)) {
+      for (const f of fs.readdirSync(SESSION_DIR)) {
+        if (!f.endsWith(".json")) continue;
+        try {
+          const j = JSON.parse(fs.readFileSync(path.join(SESSION_DIR, f), "utf8"));
+          consider(f.slice(0, -5), j.updated_at);
+        } catch { /* 单个坏文件跳过 */ }
+      }
+    }
+  } catch { /* 目录读不了就算了 */ }
+  return best || DEFAULT_SESSION;
+}
 
 const log = (...a) => console.log("[rolling-memory]", ...a);
 
@@ -333,14 +491,20 @@ function migrateLegacy(parsed) {
   return { t1_lines: t1, t1_state: state, t2_lines: splitByDate(t2str) };
 }
 
+// 当前绑定会话的摘要文件。没绑定（模块刚加载、init 之前）时按默认会话算。
+function activeSummaryFile() {
+  return summaryFileOf(curS ? curS.id : DEFAULT_SESSION);
+}
+
 function touchMtime() {
-  try { loadedMtimeMs = fs.statSync(SUMMARY_FILE).mtimeMs; } catch { loadedMtimeMs = 0; }
+  try { loadedMtimeMs = fs.statSync(activeSummaryFile()).mtimeMs; } catch { loadedMtimeMs = 0; }
 }
 
 function loadSummary() {
+  const file = activeSummaryFile();
   try {
-    if (!fs.existsSync(SUMMARY_FILE)) { loadedMtimeMs = 0; return; }
-    const parsed = JSON.parse(fs.readFileSync(SUMMARY_FILE, "utf8"));
+    if (!fs.existsSync(file)) { loadedMtimeMs = 0; return; }
+    const parsed = JSON.parse(fs.readFileSync(file, "utf8"));
     if (Array.isArray(parsed.t1_lines) || Array.isArray(parsed.t2_lines)) {
       t1Lines = normalizeLines(parsed.t1_lines);
       t2Lines = normalizeLines(parsed.t2_lines);
@@ -372,6 +536,7 @@ function loadSummary() {
 // 为什么不能只靠 mtime：NTFS/Node 的 mtimeMs 只有 ~1ms 粒度，同一毫秒内的两次写入
 // 时间戳完全相同（实测过），"改完立刻读"会静默读到旧态——正是这个功能最常走的路径。
 function reloadIfChanged() {
+  const file = activeSummaryFile();
   try {
     if (fs.existsSync(RELOAD_FLAG)) {
       try { fs.unlinkSync(RELOAD_FLAG); } catch { /* 清不掉也无妨，下次再试 */ }
@@ -379,8 +544,8 @@ function reloadIfChanged() {
       loadSummary();
       return true;
     }
-    if (!fs.existsSync(SUMMARY_FILE)) return false;
-    if (fs.statSync(SUMMARY_FILE).mtimeMs === loadedMtimeMs) return false;
+    if (!fs.existsSync(file)) return false;
+    if (fs.statSync(file).mtimeMs === loadedMtimeMs) return false;
     log("检测到 summaries.json 的 mtime 变化，重读摘要");
     loadSummary();
     return true;
@@ -398,10 +563,14 @@ function markExternalChange() {
 }
 
 function saveSummary() {
+  const file = activeSummaryFile();
   try {
     fs.mkdirSync(STATE_DIR, { recursive: true });
+    // 【v1.9】非默认会话落到 sessions/<id>.json；默认会话仍是 summaries.json
+    if (file !== SUMMARY_FILE) fs.mkdirSync(SESSION_DIR, { recursive: true });
     // 字符串镜像 t1/t2 供 viewer.js 与 stats() 直接读，格式与旧版一致
     summaryState = {
+      session: curS ? curS.id : DEFAULT_SESSION,
       t1_lines: t1Lines,
       t1_state: t1State,
       t2_lines: t2Lines,
@@ -412,9 +581,9 @@ function saveSummary() {
     };
     // 【v1.4】改成 tmp + rename 原子替换：viewer 与本进程都可能改这个文件，
     // 直接 writeFileSync 有被另一个进程读到半截 JSON 的风险（读到就静默回旧态）。
-    const tmp = SUMMARY_FILE + ".tmp";
+    const tmp = file + ".tmp";
     fs.writeFileSync(tmp, JSON.stringify(summaryState, null, 1));
-    fs.renameSync(tmp, SUMMARY_FILE);
+    fs.renameSync(tmp, file);
     touchMtime();
   } catch (e) { log("摘要保存失败(忽略):", e.message); }
 }
@@ -430,6 +599,7 @@ function saveSummary() {
 // ========================
 function view() {
   return {
+    session: curS ? curS.id : DEFAULT_SESSION,
     t1: renderT1(),
     t2: renderT2(),
     t1_lines: t1Lines.map((l) => ({ ts: l.ts, text: l.text })),
@@ -452,9 +622,44 @@ function view() {
 }
 
 // 只读快照：先重读磁盘（另一个进程可能刚改过），再回视图
-function snapshot() {
+function snapshot(sessionId) {
+  if (sessionId) bindSession(sessionId);
   loadSummary();
   return view();
+}
+
+// 【v1.9】列出所有会话（内存里的 + 磁盘上的），按最近更新倒序。
+// 查看器用它做会话下拉；调用方也可以拿它做巡检。
+function listSessions() {
+  const seen = new Map();
+  const put = (id, at) => {
+    const prev = seen.get(id);
+    const t = at ? Date.parse(at) || 0 : 0;
+    if (!prev || t > prev.t) seen.set(id, { id, updated_at: at || null, t });
+  };
+  try {
+    if (fs.existsSync(SUMMARY_FILE)) put(DEFAULT_SESSION, JSON.parse(fs.readFileSync(SUMMARY_FILE, "utf8")).updated_at);
+  } catch { /* 坏文件跳过 */ }
+  try {
+    if (fs.existsSync(SESSION_DIR)) {
+      for (const f of fs.readdirSync(SESSION_DIR)) {
+        if (!f.endsWith(".json")) continue;
+        try { put(f.slice(0, -5), JSON.parse(fs.readFileSync(path.join(SESSION_DIR, f), "utf8")).updated_at); }
+        catch { put(f.slice(0, -5), null); }
+      }
+    }
+  } catch { /* 目录读不了就算了 */ }
+  for (const s of sessions.values()) put(s.id, s.updatedAt);
+  return [...seen.values()]
+    .map((x) => ({
+      id: x.id,
+      updated_at: x.updated_at,
+      is_default: x.id === DEFAULT_SESSION,
+      loaded: sessions.has(x.id),          // 是否已经在内存里（有 lastMsgs，能继续滑窗检测）
+      pending: sessions.has(x.id) ? sessions.get(x.id).pending.length : 0,
+      current: !!curS && curS.id === x.id,
+    }))
+    .sort((a, b) => (Date.parse(b.updated_at) || 0) - (Date.parse(a.updated_at) || 0));
 }
 
 function rowsOf(target) {
@@ -467,6 +672,7 @@ function rowsOf(target) {
 
 // 删：给了 index 删那一行（查看器的小 × 走这条）；没给就按 count 从**最旧端**删（默认 1 条）。
 function deleteRows(target, opts = {}) {
+  if (opts.sessionId) bindSession(opts.sessionId);
   loadSummary();
   const t = String(target || "t1").trim().toLowerCase();
   // index 是"删哪一行"，与"从最旧端删几条"必须严格区分：给了但给歪了（"abc"）要报错，
@@ -499,7 +705,8 @@ function deleteRows(target, opts = {}) {
 
 // 改：整条替换。行内不换行（一行一条话题）；若改完丢了开头的日期，用原时间戳补回去——
 // 时间戳是 tsOf() 从正文现算的，丢了这行就再匹配不上 close、也逃过 T2 日期淘汰。
-function editRows(target, index, text) {
+function editRows(target, index, text, sessionId) {
+  if (sessionId) bindSession(sessionId);
   loadSummary();
   const t = String(target || "t1").trim().toLowerCase();
   let body = String(text == null ? "" : text).trim().replace(/\s*\n+\s*/g, " ");
@@ -557,26 +764,128 @@ function init(opts = {}) {
     llmTimeoutMs: num("LEDGER_LLM_TIMEOUT_MS", DEFAULTS.llmTimeoutMs),
     userLabel: getEnv("LEDGER_USER_LABEL", DEFAULTS.userLabel),
     assistantLabel: getEnv("LEDGER_ASSISTANT_LABEL", DEFAULTS.assistantLabel),
+    // 【v1.9】多会话隔离：LEDGER_SESSION_ISOLATION=0 可关掉（回到 v1.8 的"一份摘要管所有窗口"）
+    // 0 / false / no / off 都算关——只认 "false" 的话，配了 =0 的人会以为关了其实开着。
+    sessionIsolation: !/^(0|false|no|off)$/i.test(String(getEnv("LEDGER_SESSION_ISOLATION", "true")).trim()),
+    maxSessions: num("LEDGER_MAX_SESSIONS", DEFAULTS.maxSessions),
   };
   // 【v1.5】压缩目标不得高于触发线：t1CompressTo 配得比 t1MaxChars 大时，
   // "摘到目标内"永远摘不到（摘完仍超限），会变成每轮都摘一次却始终超限的静默故障。
   // 默认值本身是自洽的（1200 < 1500），这里只是防手配歪。
   if (cfg.t1CompressTo > cfg.t1MaxChars) cfg.t1CompressTo = cfg.t1MaxChars;
+  // 【v1.9】绑定默认会话：单会话用户的行为与 v1.8 完全一致（还是读 summaries.json）
+  bindSession(DEFAULT_SESSION);
+  // init 的语义是「进程启动」：除了读盘，还要把**不落盘的内存态**清干净。
+  // 窗口追踪和待结算缓冲都不写盘，真实重启本来就没有；热重启（反复 init）也该一样，
+  // 否则"重启后第一个请求归给谁"会被上一轮的内存残留带偏。
+  for (const s of sessions.values()) {
+    s.lastMsgs = [];
+    s.pending = [];
+    s.pendingFps = new Set();
+    s.busy = false;
+    s.rerunNeeded = false;
+  }
+  unbound.length = 0;
   loadSummary();
   const sameUpstream = !cfg.chatApiBase || cfg.chatApiBase === cfg.apiBase;
   log(
     `已初始化（结算 model=${cfg.model || "未配置"}，T1 压到 ${cfg.t1CompressTo} 字（超 ${cfg.t1MaxChars} 字或 ${cfg.t1MaxLines} 行触发），` +
     `非今天 ≥${cfg.t1LightLines} 行时轻整压到 ${cfg.t1LightCompressTo} 字，` +
     `摘要 T1=${t1Lines.length} 行/${t1Chars()} 字 / T2=${t2Lines.length} 行/${t2Chars()} 字，T2 淘汰 ${cfg.t2MaxDays} 天，` +
-    `触发=${cfg.bufferCount} 条/${cfg.bufferChars} 字，上游=${sameUpstream ? "与对话同源" : "独立（双上游）"}）`
+    `触发=${cfg.bufferCount} 条/${cfg.bufferChars} 字，上游=${sameUpstream ? "与对话同源" : "独立（双上游）"}，` +
+    `会话隔离=${cfg.sessionIsolation ? `开（最多 ${cfg.maxSessions} 个）` : "关"}）`
   );
 }
 
 // ========================
-// 请求观察：滑窗检测 → 缓冲
+// 请求观察：会话识别 → 滑窗检测 → 缓冲
 // messages: 客户端实际发给 LLM 的消息数组（system/tool 消息自动跳过）
+// opts.sessionId: 可选，调用方显式指定会话（网关能拿到 header 时强烈建议传）
 // ========================
-function observeRequest(messages) {
+
+// 待确认池：还没归属到任何会话的请求。
+// 新会话的第一轮通常只有一两句，和「标题生成」这类后台请求长得一模一样，当场分不出来。
+// 所以先放进池子，等后续某一轮带着历史来认领；认领不到的就是后台请求，过期自动淘汰。
+// 池子能同时躺多个候选——两个会话交替开场时，甲的第一句和乙的第一句互不干扰。
+const unbound = [];
+
+// 窗口重叠度：prev 的后缀 == cur 的前缀，最长匹配多少条。0 = 完全无交集。
+function overlapOf(prevFps, curFps) {
+  if (!prevFps.length || !curFps.length) return 0;
+  const maxK = Math.min(prevFps.length, curFps.length);
+  for (let k = maxK; k > 0; k--) {
+    let ok = true;
+    for (let i = 0; i < k; i++) {
+      if (prevFps[prevFps.length - k + i] !== curFps[i]) { ok = false; break; }
+    }
+    if (ok) return k;
+  }
+  return 0;
+}
+
+// 自动会话 id：用这个会话第一句话的指纹。确定性——重启后同一句话还是同一个 id。
+function autoSessionId(msgs) {
+  const first = (msgs && msgs[0] && msgs[0].fp) || "x";
+  return "auto-" + String(first).slice(0, 12);
+}
+
+// 认领这次请求属于哪个会话。返回 { id, seed? } / null（进池等下一轮）
+//
+// 判决顺序（从可靠到启发式）：
+//   ① 调用方显式给的 id             —— 永远准
+//   ② 和某个已建会话的窗口重叠       —— 准（同一会话一定带历史）
+//   ③ 和池里某个待确认候选重叠       —— 准（新会话的第二轮来了）
+//   ④ 冷启动（没有任何会话带窗口历史）—— 归给磁盘上最近写过的那个
+//   ⑤ 零重合 + 消息不少              —— 开新会话
+//   ⑥ 零重合 + 消息很少              —— 进池（后台请求永远等不到认领）
+function resolveSession(cur, curFps, opts) {
+  // ① 调用方显式指定
+  if (opts && opts.sessionId) return { id: sanitizeSessionId(opts.sessionId) };
+  // ② 关掉隔离 → 全部走默认会话（v1.8 行为）
+  if (!cfg.sessionIsolation) return { id: DEFAULT_SESSION };
+
+  // ③ 和某个已有会话的窗口重叠 → 就是它
+  //    同一会话里客户端一定会把历史带上（不带就没法对话），所以 overlap>0 是可靠信号。
+  let best = null, bestK = 0;
+  for (const s of sessions.values()) {
+    const k = overlapOf(s.lastMsgs.map((m) => m.fp), curFps);
+    if (k > bestK) { bestK = k; best = s; }
+  }
+  if (best) return { id: best.id };
+
+  // ④ 和池里某个候选重叠 → 这是那个新会话的第二轮，正式建档
+  for (let i = 0; i < unbound.length; i++) {
+    const u = unbound[i];
+    const k = overlapOf(u.msgs.map((m) => m.fp), curFps);
+    if (k > 0) {
+      unbound.splice(i, 1);
+      return {
+        id: autoSessionId(u.msgs),
+        seed: u.msgs.slice(0, u.msgs.length - k), // 挂起那轮里已经滑出的部分，补进缓冲
+      };
+    }
+  }
+
+  // ⑤ 冷启动：内存里没有任何会话带窗口历史（刚启动，或重启后的第一个请求）。
+  //    归给磁盘上最近写过的那个 → 单会话用户重启后继续用自己的记忆，不会新建空档。
+  const hasHistory = [...sessions.values()].some((s) => s.lastMsgs.length > 0);
+  if (!hasHistory) return { id: mostRecentSessionId() };
+
+  // ⑥ 零重合且消息不少 → 新会话。
+  //    为什么不归给最近活跃的会话：那等于把"新窗口"的旧内容当成滑出吞进别人的摘要，
+  //    正是 v1.8 串味的根。多开一个槽最多费点内存，吞错却是永久污染。
+  //    （代价：客户端窗口整体滑走、旧消息全出窗时会被拆成新会话——记忆不丢，只是分家。）
+  if (cur.length >= 4) return { id: autoSessionId(cur) };
+
+  // ⑦ 消息很少又是全新内容：可能是后台小请求（标题生成），也可能是新会话的第一句。
+  //    进池等下一轮确认；后台请求永远等不到认领，池满即淘汰。
+  unbound.push({ msgs: cur.slice(), at: Date.now() });
+  while (unbound.length > 8) unbound.shift();
+  log(`本轮仅 ${cur.length} 条且与所有会话无重合，进待确认池（等下一轮认领）`);
+  return null;
+}
+
+function observeRequest(messages, opts = {}) {
   if (!cfg.enabled) return;
   try {
     const cur = [];
@@ -587,53 +896,46 @@ function observeRequest(messages) {
       cur.push({ role: m.role, text, fp: fpOf(m.role, text) });
     }
 
-    // 指纹重叠：cur 的前缀 == 上一请求的后缀 → 重叠部分之外的前段就是滑出的
+    // 【v1.9】先认领会话，再走滑窗。这一步是「换模型不断记忆」和「多会话不串味」的根。
     const curFps = cur.map((m) => m.fp);
-    let overlap = 0;
+    const pick = resolveSession(cur, curFps, opts);
+    if (!pick || !pick.id) return; // 已进待确认池（或判为后台请求），本轮不记账
+    bindSession(pick.id);
+    if (pick.seed && pick.seed.length) addPendingBatch(pick.seed);
+
+    // 指纹重叠：cur 的前缀 == 上一请求的后缀 → 重叠部分之外的前段就是滑出的
     const prevFps = lastMsgs.map((m) => m.fp);
-    if (prevFps.length) {
-      const maxK = Math.min(prevFps.length, curFps.length);
-      for (let k = maxK; k > 0; k--) {
-        let ok = true;
-        for (let i = 0; i < k; i++) {
-          if (prevFps[prevFps.length - k + i] !== curFps[i]) { ok = false; break; }
-        }
-        if (ok) { overlap = k; break; }
-      }
-    }
+    const overlap = overlapOf(prevFps, curFps);
 
-    // 【2026-09-20】后台小请求判断（旧版注释承诺但代码缺失，且判据方向是错的）。
-    // 病症：标题生成这类后台小请求与上一轮无一重合时，会被直接判成换窗，
-    //      把上一轮全部消息倒进 pending 并可能立刻触发结算 → 摘要被污染。
-    // 判据经真实日志实测校正：后台请求的特征是【本轮极少】
-    //   （实测 title 生成请求 total=1，正常对话 total=17~24），
-    // 而不是旧注释写的"上轮 <6 条"——那样写实战里永远不成立，等于没修。
-    const BG_CUR_MAX = 3;
-    const looksLikeBackground =
-      prevFps.length > 0 && cur.length > 0 && cur.length <= BG_CUR_MAX && overlap === 0;
-    const isNewWindow = prevFps.length > 0 && overlap === 0 && !looksLikeBackground;
-
-    if (looksLikeBackground) {
-      log(`检测到后台小请求（本轮仅 ${cur.length} 条、与上轮无重合），跳过换窗处理`);
-    }
-
-    if (isNewWindow) {
-      // 换窗：旧会话整体消失。已滑出攒在 pending 的部分先结算，
-      // 最后一轮消息（还没机会滑出就换窗了）也并入缓冲，保住尾巴。
-      addPendingBatch(lastMsgs);
-      if (pendingChars() > 0) scheduleCycle("window-flush");
-    } else if (overlap > 0) {
+    // 【v1.9 关键改动】原来这里有个 isNewWindow 分支：零重合就当成「换窗」，
+    // 把上一轮整个窗口倒进 pending 结算。那正是串味的来源——A 说一句、B 说一句，
+    // 两边的窗口轮流被倒进同一份摘要（实测 12 条消息被重复结算 2~4 次）。
+    // 现在零重合的请求在 resolveSession 里就被分流了（挂起 / 新会话 / 归一化），
+    // 走到这里的**一定是同一会话**，只需要处理「部分滑出」。
+    if (overlap > 0) {
       addPendingBatch(lastMsgs.slice(0, lastMsgs.length - overlap));
+    } else if (!cfg.sessionIsolation && lastMsgs.length) {
+      // 【兼容】关掉隔离（LEDGER_SESSION_ISOLATION=0）时保留 v1.8 的换窗行为：
+      // 零重合 + 本轮消息不少 → 视为"旧窗口整体消失"，把上一轮整个窗口倒进缓冲，保住尾巴。
+      // 本轮只有一两条的按"后台小请求"跳过（标题生成这类），否则每次请求都会把整窗倒一遍。
+      // 这两条只在单份摘要模式下成立——开隔离时它们正是串味的根，所以不共存。
+      if (cur.length > 3) {
+        addPendingBatch(lastMsgs);
+        if (pendingChars() > 0) scheduleCycle("window-flush");
+      } else {
+        log(`检测到后台小请求（本轮仅 ${cur.length} 条、与上轮无重合），跳过换窗处理`);
+      }
     }
 
     maybeScheduleCycle();
 
     // 截断隐患显式化：当前小窗口下冗余，但若客户端窗口放大，
-    // 这里会静默切成后半段并破坏「前缀匹配」前提，且换窗时被截掉的部分永久丢失。
+    // 这里会静默切成后半段并破坏「前缀匹配」前提，换窗时被截掉的部分永久丢失。
     if (cur.length > TRACK_MAX_MSGS) {
       log(`注意：本轮消息 ${cur.length} 条超过追踪上限 ${TRACK_MAX_MSGS}，已截断（换窗时前段会丢）`);
     }
     lastMsgs = cur.slice(-TRACK_MAX_MSGS);
+    if (curS) harvestSession(curS); // 及时把 lastMsgs/pending 收回会话对象
   } catch (e) {
     log("观察失败(忽略):", e.message);
   }
@@ -672,14 +974,20 @@ function maybeScheduleCycle() {
 }
 
 function scheduleCycle(reason) {
-  if (busy) { rerunNeeded = true; return; }
+  // 【v1.9】busy / rerunNeeded 是**每个会话各自**的状态：A 会话在结算时，
+  // B 会话的消息照常能触发自己的结算，不会被 A 堵住。
+  const sid = curS ? curS.id : DEFAULT_SESSION;
+  if (busy) { rerunNeeded = true; if (curS) harvestSession(curS); return; }
   busy = true;
+  if (curS) harvestSession(curS); // 把 busy=true 收回会话，避免下次绑定别人时被覆盖
   setImmediate(() => {
-    runCycle(reason).catch((e) => log("结算异常(忽略):", e.message));
+    runCycle(reason, sid).catch((e) => log("结算异常(忽略):", e.message));
   });
 }
 
-async function runCycle(reason) {
+async function runCycle(reason, sid) {
+  // setImmediate 回调执行时，全局可能已经绑到别的会话了 → 第一件事是绑回来
+  bindSession(sid);
   const batch = pending;
   const batchChars = batch.reduce((s, m) => s + m.text.length, 0);
   pending = [];
@@ -700,8 +1008,9 @@ async function runCycle(reason) {
     }
   }
   try {
-    await settleBatch(batch, reason);
+    await settleBatch(batch, reason, sid);
   } catch (e) {
+    bindSession(sid);
     log(`结算失败（${e.message}），消息重新排队`);
     for (const m of batch.slice().reverse()) pending.unshift(m);
     for (const m of batch) pendingFps.add(m.key || m.fp);
@@ -710,11 +1019,13 @@ async function runCycle(reason) {
       pendingFps.delete(dropped.key || dropped.fp);
     }
   }
+  bindSession(sid);
   busy = false;
   if (rerunNeeded) {
     rerunNeeded = false;
     if (pending.length >= cfg.bufferCount || pendingChars() >= cfg.bufferChars) scheduleCycle("rerun");
   }
+  if (curS) harvestSession(curS);
 }
 
 // ========================
@@ -727,9 +1038,12 @@ async function runCycle(reason) {
 //   ⑤ T2 双淘汰：日期过期（t2MaxDays）+ 超字数
 // 结算前强制从磁盘重读摘要：外部手改 T1/T2 不会被内存旧态覆盖。
 // ========================
-async function settleBatch(batch, reason) {
+async function settleBatch(batch, reason, sid) {
   if (!batch.length) return;
-  loadSummary(); // 手改保护
+  // 【v1.9】绑定到自己的会话再干活。runCycle 已经绑过一次，但这里是异步函数、
+  // 可能被别处直接调用，所以自己再确认一次。
+  if (sid) bindSession(sid);
+  loadSummary(); // 手改保护（读的是当前会话自己的文件）
   const lines = batch
     .map((m) => `${m.role === "user" ? cfg.userLabel : cfg.assistantLabel}：${m.text.slice(0, 400)}`)
     .join("\n");
@@ -776,6 +1090,7 @@ ${lines.slice(0, 6000)}`;
   // 白跑一整批再进重试（与 t2-merge 同病，那条 v1.4 已传 minimal）。这是抽取+按规则归并的活，
   // 不靠长思考；若日后发现摘要质量下降，把这里抬到 "low" 即可（别直接删，删了空稿会回来）。
   let raw = await chatOnce(sys, user, { forceJson: true, kind: "settle", effort: "minimal" });
+  if (sid) bindSession(sid); // await 期间可能被别的会话抢占，回来先绑回去
   let parsed = extractJson(raw);
   if (!parsed) {
     // 【v1.3】解析失败与上游故障性质不同：这批消息最可能就此永久消失（runCycle 已清空 pending，
@@ -783,6 +1098,7 @@ ${lines.slice(0, 6000)}`;
     log(`结算输出无法解析（${reason}），重试一次…`);
     try {
       raw = await chatOnce(sys, user, { forceJson: true, kind: "settle-retry", effort: "minimal" });
+      if (sid) bindSession(sid);
       parsed = extractJson(raw);
     } catch (e) { log("结算重试失败:", e.message); }
   }
@@ -863,10 +1179,10 @@ ${lines.slice(0, 6000)}`;
   let moved = [];
   let what = "未超限";
   if (shouldRepack) {
-    moved = await repackT1(oldLines);
+    moved = await repackT1(oldLines, {}, sid);
     what = `跨天整压（非今天 ${oldChars}→${cfg.t1CompressTo} 字）`;
   } else if (shouldLight) {
-    moved = await repackT1(oldLines, { light: true });
+    moved = await repackT1(oldLines, { light: true }, sid);
     what = `跨天轻整压（非今天 ${oldLines.length} 行 ${oldChars}→${cfg.t1LightCompressTo} 字）`;
   } else if (t1OverLimit()) {
     moved = evictT1OverLimit();
@@ -875,11 +1191,12 @@ ${lines.slice(0, 6000)}`;
   if (moved.length) {
     archiveEvicted(moved, reason);
     try {
-      await mergeInto2(moved);
+      await mergeInto2(moved, sid);
     } catch (e) {
       // 【v1.4 根因修复】合并失败**不再把行放回 T1**——那正是"T1 只增不减、超限静默常驻"的根因：
       // 线上四次 t2-merge 全部因 thinking 烧满 max_tokens 返回空 → 行被放回 → T1 越滚越长。
       // 现在改走机械兜底：代码自己按行拼接 + 按字数淘汰，内容不丢（细节另有 t1_archive 归档）。
+      if (sid) bindSession(sid);
       log(`T2 合并失败（${e.message}），改走机械兜底并入（不再退回 T1）`);
       fallbackMergeInto2(moved);
     }
@@ -909,7 +1226,7 @@ function archiveEvicted(moved, reason) {
 
 // 把摘出的旧行压缩并入 T2。一次小调用：输入只有这几行 + 现有 T2，**不是整段 T1**。
 // v1.3 起 T2 要求"能独立读懂"（禁电报体），上限同步 220→360 字。
-async function mergeInto2(moved) {
+async function mergeInto2(moved, sid) {
   const c8 = new Date(Date.now() + 8 * 3600 * 1000);
   const cLabel = `${c8.getUTCFullYear()}年${c8.getUTCMonth() + 1}月${c8.getUTCDate()}日 ${String(c8.getUTCHours()).padStart(2, "0")}:${String(c8.getUTCMinutes()).padStart(2, "0")}`;
   const sys = `你是记忆压缩器。只输出严格 JSON，不要任何解释或代码块围栏。
@@ -930,6 +1247,7 @@ ${renderT2() || "（无）"}
 [并入的话题]
 ${moved.map((l) => l.text).join("\n")}`;
   const raw = await chatOnce(sys, user, { forceJson: true, kind: "t2-merge", effort: "minimal" });
+  if (sid) bindSession(sid);
   const parsed = extractJson(raw);
   if (!parsed || !Array.isArray(parsed.lines)) throw new Error("T2 合并输出无法解析");
   const merged = normalizeLines(parsed.lines);
@@ -961,7 +1279,7 @@ function fallbackMergeInto2(moved) {
 //   opts.light：轻整压。昨天那部分没到 t1CompressTo（无料可重压）但行数多时走这条，
 //   目标改成 t1LightCompressTo，重点是**把多行并成更少的行**；产出行数没减少就视为不可用。
 // 返回：兜底时摘进 T2 的行（交给调用方并入 T2）；压缩成功返回空数组。
-async function repackT1(oldLines, opts = {}) {
+async function repackT1(oldLines, opts = {}, sid) {
   const light = !!opts.light;
   const limit = light ? cfg.t1LightCompressTo : cfg.t1CompressTo;
   const keep = t1Lines.filter((l) => isTodayLine(l)); // 今天的行原样保留
@@ -986,6 +1304,7 @@ ${oldLines.map((l) => l.text).join("\n")}`;
   let parsed = null;
   try {
     const raw = await chatOnce(sys, user, { forceJson: true, kind: light ? "t1-light-repack" : "t1-repack", effort: "minimal" });
+    if (sid) bindSession(sid);
     parsed = extractJson(raw);
   } catch (e) {
     log(`${light ? "跨天轻整压" : "跨天整压"}调用失败（${e.message}）`);
@@ -1026,8 +1345,12 @@ function extractJson(raw) {
 // 注入：网关在每次请求消息末尾 push（同步、无重 IO、永不抛）
 // 摘要来自内存态（行列表渲染）。
 // ========================
-function injectBlocks() {
+function injectBlocks(opts = {}) {
   if (!cfg.enabled) return [];
+  // 【v1.9】不传 sessionId 就用"刚才 observeRequest 认领的那个会话"——proxy 里
+  // observeRequest 和 injectBlocks 是同一个同步块里连着调的，中间不会插进别的请求，
+  // 所以 curS 一定还是它。多会话/多进程时才需要显式传。
+  if (opts.sessionId) bindSession(opts.sessionId);
   reloadIfChanged(); // 【v1.4】外部（查看器的编辑按钮）改过 summaries.json 就重读，改完下一轮即生效
   const blocks = [];
   try {
@@ -1131,7 +1454,8 @@ function logUsage(usage, kind) {
 // 运行状态（供查看器/调试）：只读内存态，无 IO、永不抛
 // t1/t2 返回**渲染后的字符串**（行列表镜像），保持对外契约不变。
 // ========================
-function stats() {
+function stats(sessionId) {
+  if (sessionId) bindSession(sessionId);
   // t1/t2 返回**渲染后的字符串**（行列表镜像），t1Chars/t2Chars 是这两个字符串的长度，
   // 对外契约与旧版一致（viewer.js 直接读这几个字段）。
   const t1 = renderT1();
@@ -1156,7 +1480,30 @@ function stats() {
     upstreamSeparated: !!(cfg.chatApiBase && cfg.chatApiBase !== cfg.apiBase),
     pendingCount: pending.length,
     pendingChars: pendingChars(),
+    // 【v1.9】
+    session: curS ? curS.id : DEFAULT_SESSION,
+    sessionIsolation: cfg.sessionIsolation,
+    sessions: sessions.size,
+    maxSessions: cfg.maxSessions,
   };
 }
 
-module.exports = { init, observeRequest, injectBlocks, stats, snapshot, deleteRows, editRows, reloadIfChanged, repackT1 };
+// 【v1.9】清空全部内存态（会话表 + 全局变量）。
+// 用途：测试用例之间隔离；网关热重载 / 手动清库时不想重启进程也可以用。
+// 注意它**不删磁盘文件**——那是使用者的记忆，只能由人决定删不删。
+function reset() {
+  sessions.clear();
+  curS = null;
+  unbound.length = 0;
+  t1Lines = []; t1State = ""; t2Lines = [];
+  updatedAt = null; summaryState = {}; loadedMtimeMs = 0; lastRepackDay = null;
+  lastMsgs = []; pending = []; pendingFps = new Set();
+  busy = false; rerunNeeded = false;
+}
+
+module.exports = {
+  init, observeRequest, injectBlocks, stats, snapshot, deleteRows, editRows, reloadIfChanged, repackT1,
+  // 【v1.9】多会话
+  listSessions, bindSession, reset,
+  DEFAULT_SESSION, sanitizeSessionId,
+};

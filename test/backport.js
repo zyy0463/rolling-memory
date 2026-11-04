@@ -54,12 +54,20 @@ t("runCycle 重排队用 key 而非 fp（否则重复消息会串味）", () => 
 
 console.log("\n[2] 后台请求检测（旧注释承诺但代码缺失，且判据方向是错的）");
 t("判据用的是【本轮】条数，不是上轮", () => {
-  assert.ok(/const BG_CUR_MAX = 3;/.test(SRC));
-  assert.ok(/cur\.length <= BG_CUR_MAX && overlap === 0/.test(SRC));
+  // v1.9 起这条逻辑搬进了 resolveSession：零重合且本轮消息很少 → 先挂起，
+  // 等下一轮确认是不是新会话；后台请求（标题生成）永远等不到确认，于是自动丢弃。
+  assert.ok(/if \(cur\.length >= 4\)/.test(SRC), "应以本轮条数分流：少 → 挂起，多 → 归一化");
+  assert.ok(/进待确认池（等下一轮认领）/.test(SRC), "零重合的小请求应进池等确认");
   assert.ok(!/prevFps\.length < 6/.test(SRC), "不得残留错误的上轮判据");
 });
 t("后台请求与换窗互斥", () => {
-  assert.ok(/overlap === 0 && !looksLikeBackground/.test(SRC));
+  // v1.9：零重合的请求根本进不到滑窗逻辑（在 resolveSession 就被分流），
+  // 所以"换窗把上一轮整个窗口倒进 pending"这条路径已经不存在了。
+  assert.ok(!/const isNewWindow =/.test(SRC), "换窗分支必须已删除（它是串味的源头）");
+  // 整窗倒只允许存在于「关掉隔离」的兼容分支里，开隔离时不能有
+  assert.ok(/\} else if \(!cfg\.sessionIsolation && lastMsgs\.length\) \{/.test(SRC), "整窗倒必须被 !cfg.sessionIsolation 守卫住");
+  assert.ok(/if \(overlap > 0\) \{\n\s*addPendingBatch\(lastMsgs\.slice\(0, lastMsgs\.length - overlap\)\);/.test(SRC),
+    "只处理「部分滑出」，不整窗倒");
 });
 
 console.log("\n[3] 触发条件：条数为主，字数为辅");
@@ -258,7 +266,7 @@ t("index.js 读 CHAT_API_URL/CHAT_API_KEY（仅用于诊断）", () => {
 });
 t("结算永远走 LEDGER_*，不受 CHAT_* 影响", () => {
   const i = SRC.indexOf("async function chatOnce");
-  const body = SRC.slice(i, i + 900);
+  const body = SRC.slice(i, i + 1400);
   assert.ok(/!cfg\.apiBase \|\| !cfg\.apiKey/.test(body));
   assert.ok(!/chatApiBase/.test(body), "chatOnce 不得回落到对话上游");
 });
@@ -272,7 +280,7 @@ t("stats() 暴露 upstreamSeparated", () => {
   assert.ok(/upstreamSeparated: !!\(cfg\.chatApiBase && cfg\.chatApiBase !== cfg\.apiBase\)/.test(SRC));
 });
 t("stats() 对外契约仍是渲染后的 t1/t2 字符串", () => {
-  const i = SRC.indexOf("function stats()");
+  const i = SRC.indexOf("function stats(");
   const body = SRC.slice(i, i + 900);
   assert.ok(/const t1 = renderT1\(\);/.test(body));
   assert.ok(/const t2 = renderT2\(\);/.test(body));
@@ -428,14 +436,17 @@ t("外部改动重读：.reload 标记为主 + mtime 兜底", () => {
   assert.ok(/RELOAD_FLAG = path\.join\(STATE_DIR, "\.reload"\)/.test(SRC));
   assert.ok(/function reloadIfChanged\(\)/.test(SRC));
   assert.ok(/function markExternalChange\(\)/.test(SRC));
-  assert.ok(/fs\.statSync\(SUMMARY_FILE\)\.mtimeMs === loadedMtimeMs/.test(SRC), "应有 mtime 兜底判据");
+  // v1.9：文件路径改成按当前会话算（activeSummaryFile），默认会话仍是 summaries.json
+  assert.ok(/fs\.statSync\(file\)\.mtimeMs === loadedMtimeMs/.test(SRC), "应有 mtime 兜底判据");
+  assert.ok(/function activeSummaryFile\(\)/.test(SRC), "会话化后必须能算出当前会话的文件路径");
+  assert.ok(/return id === DEFAULT_SESSION \? SUMMARY_FILE/.test(SRC), "默认会话必须仍落在 summaries.json（老用户零迁移）");
   const i = SRC.indexOf("function injectBlocks");
-  assert.ok(/reloadIfChanged\(\);/.test(SRC.slice(i, i + 200)), "注入前应先检查外部改动");
+  assert.ok(/reloadIfChanged\(\);/.test(SRC.slice(i, i + 700)), "注入前应先检查外部改动");
   assert.ok(/markExternalChange\(\);\n?/.test(SRC.slice(SRC.indexOf("function deleteRows"), SRC.indexOf("function init"))), "编辑原语写完应落标记");
 });
 t("落盘是 tmp + rename 原子替换", () => {
-  assert.ok(/const tmp = SUMMARY_FILE \+ "\.tmp"/.test(SRC));
-  assert.ok(/fs\.renameSync\(tmp, SUMMARY_FILE\)/.test(SRC));
+  assert.ok(/const tmp = file \+ "\.tmp"/.test(SRC));
+  assert.ok(/fs\.renameSync\(tmp, file\)/.test(SRC));
 });
 t("t2-merge 关 thinking，失败改机械兜底（不再退回 T1）", () => {
   assert.ok(/kind: "t2-merge", effort: "minimal"/.test(SRC), "t2-merge 应传 effort=minimal");
@@ -484,7 +495,7 @@ t("白天摘行一次收到目标值（不再摘一个刚刚好的量）", () =>
   assert.ok(/while \(t1Lines\.length > cfg\.minKeepT1 && !t1WithinTarget\(\)\)/.test(seg));
 });
 t("跨天整压 repackT1：留在 T1、幂等落盘、今天的行原样保留", () => {
-  assert.ok(/async function repackT1\(oldLines, opts = \{\}\)/.test(SRC));
+  assert.ok(/async function repackT1\(oldLines, opts = \{\}, sid\)/.test(SRC));
   assert.ok(/const keep = t1Lines\.filter\(\(l\) => isTodayLine\(l\)\);/.test(SRC));
   assert.ok(/t1Lines = packed\.concat\(keep\);/.test(SRC), "整压产物必须留在 T1（不是推进 T2）");
   assert.ok(/lastRepackDay = dayKey8\(\);/.test(SRC));
@@ -546,9 +557,9 @@ t("运行时行为：init() 后新字段可读且是默认值", () => {
   assert.strictEqual(s.t1LightCompressTo, 400);
   assert.strictEqual(typeof rolling.repackT1, "function", "应导出 repackT1");
 });
-t("package.json 版本为 1.8.0", () => {
+t("package.json 版本为 1.9.0", () => {
   const pkg = JSON.parse(fs.readFileSync(path.join(__dirname, "..", "package.json"), "utf8"));
-  assert.strictEqual(pkg.version, "1.8.0");
+  assert.strictEqual(pkg.version, "1.9.0");
 });
 t("README 写了 v1.5 的压缩策略（两条触发 / 跨天整压 / 轻整压）", () => {
   assert.ok(/v1\.5/.test(README));
@@ -568,7 +579,7 @@ t(".env.example 含 v1.5 四个新变量", () => {
 
 console.log("\n[14] v1.6：注入块「优先级声明」（修外置记忆库被抢）");
 t("注入块头带优先级声明（给模型看的，不是给装的人看的）", () => {
-  const i = SRC.indexOf("function injectBlocks()");
+  const i = SRC.indexOf("function injectBlocks(");
   const seg = SRC.slice(i, i + 1400);
   assert.ok(/系统注入 · 滚动摘要/.test(seg), "块头应有「系统注入 · 滚动摘要」声明");
   assert.ok(/不是用户新说的话/.test(seg), "应说明这不是用户的新消息");
@@ -577,14 +588,14 @@ t("注入块头带优先级声明（给模型看的，不是给装的人看的�
   assert.ok(/去查长期记忆/.test(seg), "要精确细节应去查长期记忆");
 });
 t("声明在摘要正文之前（模型先读到优先级，再读到内容）", () => {
-  const i = SRC.indexOf("function injectBlocks()");
-  const seg = SRC.slice(i, i + 1400);
+  const i = SRC.indexOf("function injectBlocks(");
+  const seg = SRC.slice(i, i + 2400);
   const decl = seg.indexOf("系统注入 · 滚动摘要");
   const body = seg.indexOf("【更早对话的滚动摘要");
   assert.ok(decl > 0 && body > decl, "声明必须排在摘要正文之前");
 });
 t("声明是固定文案，不掺易变内容（缓存友好 + 不随摘要漂移）", () => {
-  const i = SRC.indexOf("function injectBlocks()");
+  const i = SRC.indexOf("function injectBlocks(");
   const declSeg = SRC.slice(i, SRC.indexOf("【更早对话的滚动摘要", i));
   assert.ok(!/\$\{/.test(declSeg), "声明里不得拼接变量");
 });
@@ -640,7 +651,7 @@ t("close 兼容时段行（叫模型填开头那截）", () => {
   assert.ok(/行首若是时段/.test(SRC), "close 规则应说明时段行怎么填");
 });
 t("runCycle 打「结算触发」并分清条数网 / 字数网", () => {
-  const i = SRC.indexOf("async function runCycle(reason)");
+  const i = SRC.indexOf("async function runCycle(reason, sid)");
   const seg = SRC.slice(i, i + 1400);
   assert.ok(/结算触发（\$\{which\}）/.test(seg), "应打出是哪个网触发的");
   assert.ok(/const byCount = batch\.length >= cfg\.bufferCount/.test(seg), "应按批次真实条数回判条数网");

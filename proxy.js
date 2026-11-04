@@ -35,6 +35,26 @@ function upstreamKey() {
   return process.env.CHAT_API_KEY || "";
 }
 
+// 【v1.9】会话标识：能让"多个会话各记各的"从"猜"变成"准"。
+// 优先级：请求头 x-rolling-session（可改名）> body 里的 session_id / metadata.conversation_id > 自动识别。
+// OpenAI 协议里没有会话字段，所以大多数客户端拿不到——那就靠窗口重叠自动认领（见 index.js）。
+// 拿得到的客户端建议配上：切模型前后、多个客户端同时用，都不会再互相污染。
+function sessionIdOf(req, body) {
+  const headerName = String(process.env.LEDGER_SESSION_HEADER || "x-rolling-session").toLowerCase();
+  const fromHeader = req.headers[headerName];
+  if (fromHeader) return String(fromHeader);
+  if (body) {
+    if (body.session_id) return String(body.session_id);
+    if (body.conversation_id) return String(body.conversation_id);
+    const md = body.metadata;
+    if (md && typeof md === "object") {
+      const v = md.session_id || md.conversation_id;
+      if (v) return String(v);
+    }
+  }
+  return ""; // 空 → 交给模块按窗口重叠自动认领
+}
+
 function forward(req, res, bodyBuf) {
   const raw = upstreamUrl();
   let u;
@@ -87,8 +107,9 @@ function start({ port } = {}) {
       try {
         const body = JSON.parse(bodyBuf.toString("utf8"));
         if (Array.isArray(body.messages)) {
-          rolling.observeRequest(body.messages);
-          const blocks = rolling.injectBlocks();
+          const sid = sessionIdOf(req, body);
+          rolling.observeRequest(body.messages, { sessionId: sid });
+          const blocks = rolling.injectBlocks({ sessionId: sid });
           if (blocks.length) body.messages = [...body.messages, ...blocks];
           bodyBuf = Buffer.from(JSON.stringify(body), "utf8");
         }

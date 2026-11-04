@@ -98,6 +98,11 @@ async function t(name, fn) {
   process.env.LEDGER_T1_MAX_CHARS = "2000";
   process.env.LEDGER_T1_MAX_LINES = "16";
   process.env.LEDGER_MIN_KEEP_T1 = "3";
+  // 【v1.9】本文件测的是 close 护栏，与会话隔离正交。
+  // 它用 seed() 反复重置摘要（等价于"同一进程里换了一份记忆"），而隔离开启时
+  // 零重合的窗口会被认领成新会话——那是隔离的正确行为，不是 close 的问题。
+  // 所以这里显式关掉隔离，让断言只落在 close 本身上。
+  process.env.LEDGER_SESSION_ISOLATION = "0";
 
   console.log("\n[v1.8] close 收紧 + 两道护栏（端到端）");
   const L = require("../index");
