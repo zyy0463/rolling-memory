@@ -5,6 +5,10 @@ state/
 # 密钥
 .env
 
+# 运行日志（可能含请求内容，绝不入库）
+proxy.log
+*.log
+
 # 系统垃圾
 .DS_Store
 Thumbs.db
