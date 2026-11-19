@@ -945,6 +945,26 @@ function pendingChars() {
   return pending.reduce((s, m) => s + m.text.length, 0);
 }
 
+/* 结算批次该切在哪 —— 「他说没回答」那类假事实的根。
+   病根：批次是按条数机械切的，而一次请求的末尾**几乎必然是「对方刚问完、自己还没答」**
+   （回复要等上游返回，客户端才发下一轮）⇒ 批次边界正好落在那十秒里。
+   摘要把「还没答」写成既成事实，而 T1 是 append-only：下一批即使含了回应，
+   规则 2「别重复摘要写过的事」也会让模型以为已经记过 ⇒ 这句假话永久留在最显眼的位置。
+   治法：批次末尾若是 user，就扣下来留在 pending，等回应一起结算（最多扣 MAX_HOLD_TAIL 条）。
+   兜底：整批都是 user（对方从没回）时照常结算、不扣 —— 至少不会卡死缓冲。 */
+// 上限取 6：默认 bufferCount=6，等于「扣到批次不会剩一条孤零零的提问为止」；
+// 整批都是 user（对方一直没回）时下面有兜底，照常结算，不会卡死缓冲。
+const MAX_HOLD_TAIL = 6;
+function batchCutIndex(list) {
+  let cut = list.length;
+  let held = 0;
+  while (cut > 0 && held < MAX_HOLD_TAIL && list[cut - 1] && list[cut - 1].role === "user") {
+    cut--; held++;
+  }
+  if (cut === 0) return list.length;
+  return cut;
+}
+
 function addPendingBatch(list) {
   const seen = new Map();
   for (const m of list) {
@@ -988,10 +1008,15 @@ function scheduleCycle(reason) {
 async function runCycle(reason, sid) {
   // setImmediate 回调执行时，全局可能已经绑到别的会话了 → 第一件事是绑回来
   bindSession(sid);
-  const batch = pending;
+  // 【v593 补丁】末尾若是对方刚问、这边还没答，扣下来等下一批一起结算（见 batchCutIndex）。
+  // 不扣的话，每批摘要都会以「对方问完、自己还没答」收尾，而 T1 append-only 永不回收。
+  const cut = batchCutIndex(pending);
+  const batch = pending.slice(0, cut);
+  const held = pending.slice(cut);
   const batchChars = batch.reduce((s, m) => s + m.text.length, 0);
-  pending = [];
-  pendingFps = new Set();
+  pending = held;
+  pendingFps = new Set(held.map((m) => m.key || m.fp));
+  if (held.length) log(`批次末尾 ${held.length} 条还没等到回应，扣下留到下一批（本批结算 ${batch.length} 条）`);
   // 【v1.7】条数与字数两个网都报 threshold，日志里分不清是谁触发的。
   // 这里按批次的真实规模回判，并顺手打出批次条数——"是不是每句都在结算"靠这一行证伪。
   if (batch.length) {
@@ -1001,7 +1026,10 @@ async function runCycle(reason, sid) {
       const which = byCount && byChars
         ? `条数 ${batch.length}≥${cfg.bufferCount} + 字数 ${batchChars}≥${cfg.bufferChars}`
         : byCount ? `条数 ${batch.length}≥${cfg.bufferCount}`
-          : `字数 ${batchChars}≥${cfg.bufferChars}`;
+          : byChars ? `字数 ${batchChars}≥${cfg.bufferChars}`
+            /* 两个数都不够，说明触发时缓冲够、但末尾几条被 batchCutIndex 扣下了 ——
+               旧代码会在这里误报「字数 X≥上限」，日志成了噪音。 */
+            : `缓冲 ${batch.length + held.length} 条，扣下 ${held.length} 条待回应`;
       log(`结算触发（${which}）：本批 ${batch.length} 条 / ${batchChars} 字`);
     } else {
       log(`结算触发（${reason}）：本批 ${batch.length} 条 / ${batchChars} 字`);
@@ -1076,7 +1104,10 @@ async function settleBatch(batch, reason, sid) {
    · 普通「聊了什么」的话题行**一律不许 close**——哪怕这件事已经过去、有结论、当天聊完了，也不填。它们不归你销：T1 装不下时由系统自己把最旧的行滚进 T2。
    · "有结论了 / 聊完了 / 已经过去了"**不是** close 的理由；只有"答应他的那件事办完了"才是。
    · 一次最多销 1~2 行。没有就输出空数组 []。拿不准就不填。
-4. state：只留最新——体力、情绪、正在忙什么（有没有不舒服、在学习还是在玩、心情如何），开头带检查时刻的时间戳。`;
+4. state：只留最新——体力、情绪、正在忙什么（有没有不舒服、在学习还是在玩、心情如何），开头带检查时刻的时间戳。
+5. **严禁**写「${cfg.userLabel}刚问完、${cfg.assistantLabel}还没答 / 尚未回应 / 等回话 / 正等他回答」这类断言——append 和 state 里都不许。
+   理由：批次是按条数机械切的，边界几乎必然落在「${cfg.userLabel}刚说完、${cfg.assistantLabel}还没回」那一秒，写进去就成了永不回收的假事实（下一批即使有回应，规则 2 也会让它不敢再写）。
+   [新对话] 里只要有 ${cfg.assistantLabel} 的回复，就照常记它说了什么；没有就干脆不提这茬，别替对方下「没回应」的结论。`;
 
   const user = `[当前时间] ${nowLabel}
 
